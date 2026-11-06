@@ -103,7 +103,7 @@ astrbot_plugin_rhodes_island_archive/
 - 页面照搬 `operatorRecruit.html`：每组一列、左侧 5px 竖条、标签胶囊、60px 半身像、底边按星级着色；不设标题、不截断。
 - 无结果时回文本，例如「博士，没有找到可以锁定稀有干员的组合」。
 
-**截图识别**：只发「公招」配一张界面截图时，用本地 `rapidocr-onnxruntime`（纯 CPU、无需 API key）识别文字，再用最长优先匹配标签词表。
+**截图识别**：只发「公招」时，插件会等你发一张界面截图（30 秒内），用本地 `rapidocr-onnxruntime`（纯 CPU、无需 API key）识别文字，再用最长优先匹配标签词表。一张图读不出标签会继续等下一张，识别成功即出图。
 
 ## 终末地
 

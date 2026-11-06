@@ -92,6 +92,9 @@ def _valid_png(body: bytes) -> bool:
 #: The keyword that opens the recruitment planner.
 _RECRUIT_KEYWORD = re.compile(r"^\s*[/／]?\s*(?:公招|公开招募)\s*")
 
+#: How long the plugin keeps waiting for a recruitment screenshot.
+_RECRUIT_WAIT = 30.0
+
 #: Separators players use between tags.
 _TAG_SPLIT = re.compile(r"[\s,，、/|]+")
 
@@ -233,6 +236,9 @@ class Main(star.Star):
         # QQ turns inline keyboard clicks into their label text, so remember
         # which operator each session last looked up.
         self._last_operator: dict[str, tuple[str, str]] = {}
+        # Sessions that asked for a recruitment screenshot, with the
+        # monotonic deadline of their waiting window.
+        self._pending_recruit: dict[str, float] = {}
         self._renderer: LocalRenderer | None = None
         self._renderer_ready = False
         if data_dir is not None:
@@ -568,39 +574,33 @@ class Main(star.Star):
             return str(path)
         return str(_store_image(body, target))
 
-    @filter.regex(r"^\s*[/／]?\s*(?:公招|公开招募)")
-    async def on_recruit(self, event: AstrMessageEvent):
-        """Answer a recruitment request with the tag combination page.
+    async def _tags_from_image(self, image_path: str) -> list[str]:
+        """Read recruitment tags out of a screenshot.
 
         Args:
-            event: The message event carrying the tags.
+            image_path: Local path of the screenshot.
+
+        Returns:
+            Recognised tags, empty when the image holds none.
+
+        Raises:
+            OCRError: If the local OCR backend is unavailable.
+        """
+        text = await recognize(image_path)
+        tags = match_recruit_tags(text, await self.arknights.recruit_vocabulary())
+        self.logger.info("recruit OCR text: %r -> %s", text, tags)
+        return tags
+
+    async def _recruit_answer(self, event: AstrMessageEvent, tags: list[str]):
+        """Render the page for one tag set.
+
+        Args:
+            event: The message event being answered.
+            tags: Recruitment tags to solve.
 
         Yields:
-            The rendered page, or a short hint when no tag was recognised.
+            The rendered page, or a short hint when nothing is available.
         """
-        if not event.is_at_or_wake_command:
-            return
-        tags = _recruit_tags(event.get_message_str())
-        if not tags:
-            image_path = await self._first_image(event)
-            if image_path is None:
-                yield event.plain_result(
-                    "请在「公招」后面跟上标签，或者直接发公招界面截图，例如：公招 资深 输出"
-                )
-                return
-            try:
-                text = await recognize(image_path)
-                tags = match_recruit_tags(
-                    text, await self.arknights.recruit_vocabulary()
-                )
-            except OCRError as exc:
-                self.logger.warning("recruit OCR failed: %s", exc)
-                yield event.plain_result("图片识别失败")
-                return
-            self.logger.info("recruit OCR text: %r -> %s", text, tags)
-            if not tags:
-                yield event.plain_result("博士，没有在图内找到标签信息")
-                return
         try:
             page = await self.arknights.recruit(tags)
         except Exception as exc:  # noqa: BLE001 - never crash the event
@@ -622,6 +622,101 @@ class Main(star.Star):
             )
             return
         yield event.image_result(image)
+
+    def _wait_for_image(self, event: AstrMessageEvent) -> None:
+        """Remember that this session owes the plugin a screenshot.
+
+        Args:
+            event: The message event that started the wait.
+        """
+        self._pending_recruit[event.unified_msg_origin] = (
+            time.monotonic() + _RECRUIT_WAIT
+        )
+
+    @filter.regex(r"^\s*[/／]?\s*(?:公招|公开招募)")
+    async def on_recruit(self, event: AstrMessageEvent):
+        """Answer a recruitment request with the tag combination page.
+
+        Args:
+            event: The message event carrying the tags.
+
+        Yields:
+            The rendered page, or a short hint when no tag was recognised.
+        """
+        if not event.is_at_or_wake_command:
+            return
+        tags = _recruit_tags(event.get_message_str())
+        if tags:
+            async for result in self._recruit_answer(event, tags):
+                yield result
+            return
+
+        image_path = await self._first_image(event)
+        if image_path is None:
+            self._wait_for_image(event)
+            yield event.plain_result(
+                f"请发送公招界面截图，{_RECRUIT_WAIT:.0f} 秒内有效；"
+                "也可以直接写标签，例如：公招 资深 输出"
+            )
+            return
+        try:
+            tags = await self._tags_from_image(image_path)
+        except OCRError as exc:
+            self.logger.warning("recruit OCR failed: %s", exc)
+            if "未安装" in str(exc):
+                yield event.plain_result(str(exc))
+                return
+            self._wait_for_image(event)
+            yield event.plain_result(
+                "博士，这张图没读出文字，请再发一张；也可以直接写标签"
+            )
+            return
+        if not tags:
+            self._wait_for_image(event)
+            yield event.plain_result("博士，没有在图内找到标签信息，请再发一张截图")
+            return
+        async for result in self._recruit_answer(event, tags):
+            yield result
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_recruit_image(self, event: AstrMessageEvent):
+        """Read a follow-up screenshot while a recruitment wait is open.
+
+        Args:
+            event: Any incoming message; only images are considered.
+
+        Yields:
+            The rendered page once the screenshot yields tags.
+        """
+        origin = event.unified_msg_origin
+        deadline = self._pending_recruit.get(origin)
+        if deadline is None:
+            return
+        if time.monotonic() > deadline:
+            self._pending_recruit.pop(origin, None)
+            return
+        image_path = await self._first_image(event)
+        if image_path is None:
+            return
+        try:
+            tags = await self._tags_from_image(image_path)
+        except OCRError as exc:
+            self.logger.warning("recruit OCR failed: %s", exc)
+            if "未安装" in str(exc):
+                self._pending_recruit.pop(origin, None)
+                yield event.plain_result(str(exc))
+                return
+            self._wait_for_image(event)
+            yield event.plain_result("博士，这张图没读出文字，请再发一张")
+            return
+        if not tags:
+            # Keep the window open so the user can send another screenshot.
+            self._wait_for_image(event)
+            yield event.plain_result("博士，没有在图内找到标签信息，请再发一张截图")
+            return
+        self._pending_recruit.pop(origin, None)
+        async for result in self._recruit_answer(event, tags):
+            yield result
 
     @filter.regex(r"^\s*[^\s/]{1,32}\s*$")
     async def on_single_name(self, event: AstrMessageEvent):
