@@ -686,25 +686,13 @@ class Main(star.Star):
                 token_image = None
             key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
             self._last_operator[key] = (entry.game, entry.entry_id)
-            if (event.get_platform_name() or "").startswith(_BUTTON_PLATFORMS):
-                # QQ cannot carry a picture and a keyboard in one message, and a
-                # markdown reply poisons the following picture send, so the card
-                # (and the device page) go out on their own and the buttons ride
-                # a second message.
-                sent = await self.context.send_message(
-                    event.unified_msg_origin, MessageChain(chain=[Image(file=image)])
-                )
-                if sent:
-                    if token_image:
-                        await self.context.send_message(
-                            event.unified_msg_origin,
-                            MessageChain(chain=[Image(file=token_image)]),
-                        )
-                    yield _card_message(entry)
-                    return
+            # Pictures first: a markdown reply resets the platform send buffer and
+            # would make the following picture fail with "无效 markdown content".
             yield event.image_result(image)
             if token_image:
                 yield event.image_result(token_image)
+            if (event.get_platform_name() or "").startswith(_BUTTON_PLATFORMS):
+                yield _card_message(entry)
             if token_image:
                 yield event.image_result(token_image)
             return
@@ -821,6 +809,7 @@ class Main(star.Star):
         }.get(operation)
         if not collector or not entry_id:
             return
+        operation_label = dict(_OPERATOR_ACTIONS).get(operation, operation)
         provider = self.arknights if game == "arknights" else self.endfield
         try:
             entry = await provider.get_detail(entry_id)
@@ -841,13 +830,20 @@ class Main(star.Star):
                 exc_info=True,
             )
             return
-        # QQ drops the media of an interaction reply, so the page is pushed as a
-        # fresh message instead of being answered inline.
-        sent = await self.context.send_message(
-            event.unified_msg_origin, MessageChain(chain=[Image(file=image)])
-        )
+        # QQ drops the media of an interaction reply; pushing a fresh picture
+        # needs active-message rights the bot may not have, so the text summary
+        # is the reliable answer and the picture stays one word away.
+        try:
+            sent = await self.context.send_message(
+                event.unified_msg_origin, MessageChain(chain=[Image(file=image)])
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to text
+            self.logger.info("active panel send failed: %s", exc)
+            sent = False
         if not sent:
-            yield event.plain_result(f"{entry.title} · {operation}")
+            yield event.plain_result(
+                f"{entry.title} · {operation}\n发送「{operation_label}」查看完整图示"
+            )
 
     async def terminate(self) -> None:
         """Release the browser and the HTTP client on disable or reload."""
