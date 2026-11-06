@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import re
+from collections.abc import Mapping
 from html import escape
 from itertools import combinations as _combinations
 from typing import Any
@@ -91,6 +92,18 @@ _VOICE_LANGS = (
     ("EN", "英文"),
 )
 
+#: Drop occurrence grades published by the mirror.
+_OCCURRENCE = {
+    "ALWAYS": "固定掉落",
+    "ALMOST": "大概率",
+    "OFTEN": "概率掉落",
+    "SOMETIMES": "小概率",
+    "RARELY": "罕见",
+}
+
+#: Elite phase labels used by the material page.
+_PHASE_LABEL = {"PHASE_0": "0", "PHASE_1": "1", "PHASE_2": "2"}
+
 #: One ``【代号】迷迭香`` pair inside the basic archive block.
 _ARCHIVE_FACT = re.compile(r"^【([^】]{1,12})】\s*(.*)$")
 
@@ -159,6 +172,18 @@ def _render(text: str, blackboard: dict[str, Any]) -> SafeHtml:
     tail = escape(plain[position:])
     pieces.append(f'<span class="mark">{tail}</span>' if marked else tail)
     return SafeHtml("".join(pieces))
+
+
+def _strip_tags(text: str) -> str:
+    """Remove the inline markup that ``_render`` adds.
+
+    Args:
+        text: Rendered description that may contain ``<span class="mark">``.
+
+    Returns:
+        The same text without any tag.
+    """
+    return re.sub(r"<[^>]+>", "", text)
 
 
 def _asset_url(directory: str, name: str) -> str:
@@ -1477,6 +1502,384 @@ class ArknightsProvider(GameDataProvider):
             "subtitle": f"语音 · {len(rows)} 条",
             "avatar": await self._avatar(entry.entry_id),
             "sections": [{"title": "语音记录", "rows": rows}],
+        }
+
+    async def _items(self) -> dict[str, Any]:
+        """Load the item table keyed by item id.
+
+        Returns:
+            Mapping of item id to its raw record.
+        """
+        table = await self._table("item_table")
+        items = table.get("items") or {}
+        return items if isinstance(items, dict) else {}
+
+    @staticmethod
+    def _rarity_stars(rarity: Any) -> str:
+        """Turn an item rarity enum into stars.
+
+        Args:
+            rarity: Upstream value such as ``"TIER_3"``.
+
+        Returns:
+            A star string such as ``"★★★"``; empty when unparsable.
+        """
+        text = str(rarity or "")
+        digits = "".join(ch for ch in text if ch.isdigit())
+        return "★" * int(digits) if digits else ""
+
+    @staticmethod
+    def _cost_text(items: Mapping[str, Any], costs: Any) -> str:
+        """Render one material cost list.
+
+        Args:
+            items: Item table keyed by id.
+            costs: Upstream list of ``{"id", "count", "type"}``.
+
+        Returns:
+            Items joined with ``、``, money shown as 龙门币.
+        """
+        parts: list[str] = []
+        for cost in costs or []:
+            if not isinstance(cost, dict):
+                continue
+            item_id = str(cost.get("id") or "")
+            count = int(cost.get("count") or 0)
+            if cost.get("type") == "GOLD" or item_id == "4001":
+                parts.append(f"龙门币 {count}")
+                continue
+            name = str((items.get(item_id) or {}).get("name") or item_id)
+            parts.append(f"{name} ×{count}")
+        return "、".join(parts)
+
+    async def material_panel(self, name: str) -> dict[str, Any] | None:
+        """Collect one material archive page.
+
+        Args:
+            name: Material name, matched exactly first and by substring after.
+
+        Returns:
+            Panel data, or ``None`` when no item carries that name.
+        """
+        items = await self._items()
+        query = name.strip()
+        if not query:
+            return None
+        target: dict[str, Any] | None = None
+        for item in items.values():
+            if str(item.get("name") or "") == query:
+                target = item
+                break
+        if target is None:
+            candidates = [
+                item for item in items.values() if query in str(item.get("name") or "")
+            ]
+            if len(candidates) == 1:
+                target = candidates[0]
+            elif candidates:
+                candidates.sort(key=lambda item: str(item.get("name") or ""))
+                target = candidates[0]
+        if target is None:
+            return None
+
+        sections: list[dict[str, Any]] = []
+        description = str(target.get("description") or "").strip()
+        if description:
+            sections.append({"title": "简介", "text": description})
+        usage = str(target.get("usage") or "").strip()
+        if usage:
+            sections.append({"title": "用途", "text": usage})
+
+        drops = [d for d in target.get("stageDropList") or [] if isinstance(d, dict)]
+        if drops:
+            stages = (await self._table("stage_table")).get("stages") or {}
+            lines: list[str] = []
+            seen: set[str] = set()
+            for drop in drops:
+                stage_id = str(drop.get("stageId") or "")
+                if not stage_id or stage_id in seen:
+                    continue
+                seen.add(stage_id)
+                stage = stages.get(stage_id) or {}
+                code = str(stage.get("code") or stage_id)
+                title = str(stage.get("name") or "")
+                grade = _OCCURRENCE.get(str(drop.get("occPer") or ""), "")
+                line = f"{code} {title}".strip()
+                lines.append(f"{line} · {grade}" if grade else line)
+                if len(lines) >= 12:
+                    break
+            if lines:
+                sections.append({"title": "掉落关卡", "text": "\n".join(lines)})
+
+        products = [
+            p for p in target.get("buildingProductList") or [] if isinstance(p, dict)
+        ]
+        if products:
+            sections.append(
+                {
+                    "title": "加工",
+                    "text": "可在加工站通过配方产出（配方 "
+                    + "、".join(str(p.get("formulaId") or "") for p in products)
+                    + "）",
+                }
+            )
+
+        icon = str(target.get("iconId") or "")
+        return {
+            "entry_id": str(target.get("itemId") or ""),
+            "title": str(target.get("name") or query),
+            "subtitle": "材料 · " + self._rarity_stars(target.get("rarity")),
+            "avatar": _asset_url("item_icon", f"{icon}.png") if icon else "",
+            "sections": sections,
+        }
+
+    async def operator_material_panel(
+        self, entry: GameDataEntry
+    ) -> dict[str, Any] | None:
+        """Collect the materials one operator needs.
+
+        Args:
+            entry: The operator entry.
+
+        Returns:
+            Panel data with 精英化 / 技能升级 / 技能专精 / 模组 sections.
+        """
+        items = await self._items()
+        record = entry.attributes
+        sections: list[dict[str, Any]] = []
+
+        evolve: list[tuple[str, str]] = []
+        for index, phase in enumerate(record.get("phases") or []):
+            cost = self._cost_text(items, phase.get("evolveCost"))
+            if cost:
+                evolve.append((f"精英 {index}", cost))
+        if evolve:
+            sections.append({"title": "精英化", "rows": evolve})
+
+        levelup: list[tuple[str, str]] = []
+        for index, step in enumerate(record.get("allSkillLvlup") or [], 1):
+            cost = self._cost_text(items, step.get("lvlUpCost"))
+            if cost:
+                levelup.append((f"技能 {index} 到 {index + 1}", cost))
+        if levelup:
+            sections.append({"title": "技能升级", "rows": levelup})
+
+        master: list[tuple[str, str]] = []
+        skills = await self._table("skill_table")
+        for slot, skill in enumerate(record.get("skills") or [], 1):
+            name = str(
+                (skills.get(str(skill.get("skillId"))) or {})
+                .get("levels", [{}])[-1]
+                .get("name")
+                or ""
+            )
+            for level, cond in enumerate(skill.get("levelUpCostCond") or [], 1):
+                cost = self._cost_text(items, cond.get("levelUpCost"))
+                if cost:
+                    master.append((f"{slot}-{level} {name}".strip(), cost))
+        if master:
+            sections.append({"title": "技能专精", "rows": master})
+
+        equip = await self._table("uniequip_table")
+        modules: list[str] = []
+        for module_id in (equip.get("charEquip") or {}).get(entry.entry_id) or []:
+            record_module = (equip.get("equipDict") or {}).get(module_id) or {}
+            if str(record_module.get("type") or "") != "ADVANCED":
+                continue
+            name = str(record_module.get("uniEquipName") or module_id)
+            for level, cost_list in sorted(
+                (record_module.get("itemCost") or {}).items()
+            ):
+                cost = self._cost_text(items, cost_list)
+                if cost:
+                    modules.append(f"{name} Lv{level} · {cost}")
+        if modules:
+            sections.append({"title": "模组", "text": "\n".join(modules)})
+
+        if not sections:
+            return None
+        return {
+            "title": entry.title,
+            "subtitle": "养成材料",
+            "avatar": await self._avatar(entry.entry_id),
+            "sections": sections,
+        }
+
+    async def _skill_owners(self) -> dict[str, list[tuple[str, str]]]:
+        """Map every skill name onto the operators that carry it.
+
+        Returns:
+            ``{skill name: [(skill id, operator name), ...]}``; repeated
+            operators are collapsed.
+        """
+        characters = await self._character_table()
+        skills = await self._table("skill_table")
+        index: dict[str, list[tuple[str, str]]] = {}
+        for entry_id, record in characters.items():
+            if not entry_id.startswith("char_"):
+                continue
+            owner = str(record.get("name") or entry_id)
+            for slot in record.get("skills") or []:
+                skill_id = str(slot.get("skillId") or "")
+                levels = (skills.get(skill_id) or {}).get("levels") or []
+                if not levels:
+                    continue
+                name = str(levels[-1].get("name") or "").strip()
+                if not name:
+                    continue
+                bucket = index.setdefault(name, [])
+                if all(existing[0] != skill_id for existing in bucket):
+                    bucket.append((skill_id, owner))
+        return index
+
+    @staticmethod
+    def _skill_meta(level: Mapping[str, Any]) -> str:
+        """Render the timing chips of one skill level.
+
+        Args:
+            level: One entry of ``skill_table[...]["levels"]``.
+
+        Returns:
+            Text such as ``自动回复 手动触发 技力 35/60 持续 30 秒``.
+        """
+        sp = level.get("spData") or {}
+        parts = [
+            _SP_TYPES.get(str(sp.get("spType") or ""), ""),
+            _SKILL_TYPES.get(str(level.get("skillType") or ""), ""),
+        ]
+        if sp.get("spCost"):
+            parts.append(
+                f"技力 {format_number(sp.get('initSp') or 0)}/{format_number(sp.get('spCost'))}"
+            )
+        duration = float(level.get("duration") or 0)
+        if duration > 0:
+            parts.append(f"持续 {format_number(duration)} 秒")
+        return " ".join(part for part in parts if part)
+
+    async def skill_panel(self, name: str) -> dict[str, Any] | None:
+        """Collect one skill page, or the list of operators using that name.
+
+        Args:
+            name: Skill name as published in ``skill_table``.
+
+        Returns:
+            Panel data, or ``None`` when no skill carries that name.
+        """
+        query = name.strip()
+        if not query:
+            return None
+        index = await self._skill_owners()
+        owners = index.get(query)
+        if not owners:
+            candidates = [key for key in index if query in key]
+            if len(candidates) == 1:
+                query = candidates[0]
+                owners = index[query]
+            else:
+                return None
+        skills = await self._table("skill_table")
+        if len(owners) > 1:
+            names = sorted({owner for _, owner in owners})
+            sections: list[dict[str, Any]] = [
+                {"title": "拥有该技能的干员", "text": "、".join(names)}
+            ]
+            first = (skills.get(owners[0][0]) or {}).get("levels") or []
+            if first:
+                level = first[-1]
+                board = {
+                    b.get("key"): b.get("value")
+                    for b in level.get("blackboard") or []
+                    if "key" in b
+                }
+                sections.insert(
+                    0, {"title": "基本信息", "text": self._skill_meta(level)}
+                )
+                text = _strip_tags(_render(level.get("description") or "", board))
+                if text:
+                    sections.append({"title": "描述", "text": text})
+            return {
+                "entry_id": f"skill_{query}",
+                "title": query,
+                "subtitle": f"技能 · {len(names)} 名干员可用",
+                "avatar": "",
+                "sections": sections,
+            }
+
+        skill_id, owner = owners[0]
+        levels = (skills.get(skill_id) or {}).get("levels") or []
+        if not levels:
+            return None
+        level = levels[-1]
+        board = {
+            b.get("key"): b.get("value")
+            for b in level.get("blackboard") or []
+            if "key" in b
+        }
+        sections: list[dict[str, Any]] = [
+            {
+                "title": "基本信息",
+                "rows": [("干员", owner)],
+                "text": self._skill_meta(level),
+            }
+        ]
+        description = _strip_tags(_render(level.get("description") or "", board))
+        if description:
+            sections.append({"title": "描述", "text": description})
+        mastery: list[str] = []
+        for position, candidate in enumerate(levels):
+            if position < 7:
+                continue
+            text = _strip_tags(_render(candidate.get("description") or "", board))
+            if text:
+                mastery.append(f"专精 {position - 6} · {text}")
+        if mastery:
+            sections.append({"title": "专精变化", "text": "\n".join(mastery)})
+        return {
+            "entry_id": f"skill_{query}",
+            "title": query,
+            "subtitle": "技能",
+            "avatar": "",
+            "sections": sections,
+        }
+
+    async def operator_skill_panel(self, entry: GameDataEntry) -> dict[str, Any] | None:
+        """Collect the skills of one operator.
+
+        Args:
+            entry: The operator entry.
+
+        Returns:
+            Panel data with one section per skill, or ``None`` without skills.
+        """
+        skills = await self._table("skill_table")
+        sections: list[dict[str, Any]] = []
+        for slot, item in enumerate(entry.attributes.get("skills") or [], 1):
+            levels = (skills.get(str(item.get("skillId"))) or {}).get("levels") or []
+            if not levels:
+                continue
+            level = levels[-1]
+            board = {
+                b.get("key"): b.get("value")
+                for b in level.get("blackboard") or []
+                if "key" in b
+            }
+            lines = [self._skill_meta(level)]
+            text = _strip_tags(_render(level.get("description") or "", board))
+            if text:
+                lines.append(text)
+            sections.append(
+                {
+                    "title": f"技能 {slot} · {level.get('name') or item.get('skillId')}",
+                    "text": "\n".join(line for line in lines if line),
+                }
+            )
+        if not sections:
+            return None
+        return {
+            "title": entry.title,
+            "subtitle": "技能",
+            "avatar": await self._avatar(entry.entry_id),
+            "sections": sections,
         }
 
     async def list_dir(self, path: str) -> list[ResourceRef]:

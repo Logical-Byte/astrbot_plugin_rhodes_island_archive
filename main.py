@@ -160,8 +160,26 @@ _PANEL_WORDS = {
     "语音": "voice",
 }
 
-#: Pattern for the sub-page words, with an optional command prefix.
-_PANEL_WORD = re.compile(r"^(?:" + "|".join(_PANEL_WORDS) + r")$")
+#: Pattern for the sub-page words; the 干员 prefix is optional.
+_PANEL_WORD = re.compile(r"^(?:干员\s*)?(?:" + "|".join(_PANEL_WORDS) + r")$")
+
+#: Material archive query, e.g. ``材料 炽合金``.
+_MATERIAL_WORD = re.compile(r"^材料\s*")
+
+#: Operator material query, e.g. ``干员材料 迷迭香``.
+_OPERATOR_MATERIAL_WORD = re.compile(r"^干员\s*材料\s*")
+
+#: Suffix form, e.g. ``迷迭香材料``.
+_MATERIAL_SUFFIX = re.compile(r"^([^\s/]{1,24})材料$")
+
+#: Skill archive query, e.g. ``技能 思维膨大``.
+_SKILL_WORD = re.compile(r"^技能\s*")
+
+#: Operator skill query, e.g. ``干员技能 迷迭香``.
+_OPERATOR_SKILL_WORD = re.compile(r"^干员\s*技能\s*")
+
+#: Suffix form, e.g. ``迷迭香技能``.
+_SKILL_SUFFIX = re.compile(r"^([^\s/]{1,24})技能$")
 
 
 def _operator_buttons(entry: GameDataEntry) -> ActionRow:
@@ -727,6 +745,228 @@ class Main(star.Star):
         async for result in self._recruit_answer(event, tags):
             yield result
 
+    @filter.regex(_OPERATOR_MATERIAL_WORD)
+    async def on_operator_material(self, event: AstrMessageEvent):
+        """Answer 干员材料 with the materials one operator needs.
+
+        Args:
+            event: The message event carrying the operator name.
+
+        Yields:
+            The rendered material page, or a short hint.
+        """
+        query = _OPERATOR_MATERIAL_WORD.sub(
+            "", event.get_message_str(), count=1
+        ).strip()
+        try:
+            if query:
+                entry = await self.arknights.match(query)
+                if entry is None:
+                    yield event.plain_result(f"没有找到干员「{query}」")
+                    return
+            else:
+                key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
+                remembered = self._last_operator.get(key)
+                if remembered is None:
+                    yield event.plain_result(
+                        "请在「干员材料」后面跟上干员名，例如：干员材料 迷迭香"
+                    )
+                    return
+                entry = await self.arknights.get_detail(remembered[1])
+            panel = await self.arknights.operator_material_panel(entry)
+        except Exception as exc:  # noqa: BLE001 - never crash the event
+            self.logger.warning("operator material %s failed: %s", query, exc)
+            return
+        if not panel:
+            yield event.plain_result(f"{entry.title} 没有养成材料数据")
+            return
+        panel["operation"] = "material"
+        try:
+            image = await self._panel_image(self.arknights, entry, panel)
+        except Exception as exc:  # noqa: BLE001 - rendering must not crash
+            self.logger.warning("material page failed: %s", exc)
+            return
+        yield event.image_result(image)
+
+    @filter.regex(_MATERIAL_SUFFIX)
+    async def on_material_suffix(self, event: AstrMessageEvent):
+        """Answer ``<干员名>材料`` with that operator's material list.
+
+        Args:
+            event: The message event carrying the operator name and suffix.
+
+        Yields:
+            The rendered material page, or a hint when the name is unknown.
+        """
+        match = _MATERIAL_SUFFIX.match(event.get_message_str().strip())
+        if match is None:
+            return
+        name = match.group(1).strip()
+        try:
+            entry = await self.arknights.match(name)
+            if entry is None:
+                panel = await self.arknights.material_panel(name)
+                if panel is None:
+                    yield event.plain_result(f"没有找到干员「{name}」")
+                    return
+                item = GameDataEntry(
+                    game="arknights",
+                    category="material",
+                    entry_id=str(panel.get("entry_id") or name),
+                    title=str(panel.get("title") or name),
+                )
+                panel["operation"] = "material"
+                image = await self._panel_image(self.arknights, item, panel)
+                yield event.image_result(image)
+                return
+            panel = await self.arknights.operator_material_panel(entry)
+        except Exception as exc:  # noqa: BLE001 - never crash the event
+            self.logger.warning("material suffix %r failed: %s", name, exc)
+            return
+        if not panel:
+            yield event.plain_result(f"{entry.title} 没有养成材料数据")
+            return
+        panel["operation"] = "material"
+        try:
+            image = await self._panel_image(self.arknights, entry, panel)
+        except Exception as exc:  # noqa: BLE001 - rendering must not crash
+            self.logger.warning("material page failed: %s", exc)
+            return
+        yield event.image_result(image)
+
+    async def _skill_answer(self, event: AstrMessageEvent, query: str):
+        """Answer a skill request for an operator name or a skill name.
+
+        Args:
+            event: The message event being answered.
+            query: Operator name, or a skill name when no operator matches.
+
+        Yields:
+            The rendered skill page, or a short hint.
+        """
+        try:
+            entry = await self.arknights.match(query)
+            if entry is not None:
+                panel = await self.arknights.operator_skill_panel(entry)
+                target = entry
+            else:
+                panel = await self.arknights.skill_panel(query)
+                target = GameDataEntry(
+                    game="arknights",
+                    category="skill",
+                    entry_id=str((panel or {}).get("entry_id") or query),
+                    title=str((panel or {}).get("title") or query),
+                )
+        except Exception as exc:  # noqa: BLE001 - never crash the event
+            self.logger.warning("skill %r failed: %s", query, exc)
+            return
+        if not panel:
+            yield event.plain_result(f"没有找到技能「{query}」")
+            return
+        panel["operation"] = "skill"
+        try:
+            image = await self._panel_image(self.arknights, target, panel)
+        except Exception as exc:  # noqa: BLE001 - rendering must not crash
+            self.logger.warning("skill page failed: %s", exc)
+            return
+        yield event.image_result(image)
+
+    @filter.regex(_OPERATOR_SKILL_WORD)
+    async def on_operator_skill(self, event: AstrMessageEvent):
+        """Answer ``干员技能 <name>`` with that operator's skills.
+
+        Args:
+            event: The message event carrying the operator name.
+
+        Yields:
+            The rendered skill page.
+        """
+        query = _OPERATOR_SKILL_WORD.sub("", event.get_message_str(), count=1).strip()
+        if not query:
+            yield event.plain_result(
+                "请在「干员技能」后面跟上干员名，例如：干员技能 迷迭香"
+            )
+            return
+        async for item in self._skill_answer(event, query):
+            yield item
+
+    @filter.regex(_SKILL_SUFFIX)
+    async def on_skill_suffix(self, event: AstrMessageEvent):
+        """Answer ``<name>技能`` for an operator or a skill.
+
+        Args:
+            event: The message event carrying the name and suffix.
+
+        Yields:
+            The rendered skill page.
+        """
+        match = _SKILL_SUFFIX.match(event.get_message_str().strip())
+        if match is None:
+            return
+        async for item in self._skill_answer(event, match.group(1).strip()):
+            yield item
+
+    @filter.regex(_SKILL_WORD)
+    async def on_skill(self, event: AstrMessageEvent):
+        """Answer ``技能 <name>`` for an operator or a skill.
+
+        Args:
+            event: The message event carrying the name.
+
+        Yields:
+            The rendered skill page.
+        """
+        query = _SKILL_WORD.sub("", event.get_message_str(), count=1).strip()
+        if not query:
+            yield event.plain_result("请在「技能」后面跟上名称，例如：技能 迷迭香")
+            return
+        async for item in self._skill_answer(event, query):
+            yield item
+
+    @filter.regex(_MATERIAL_WORD)
+    async def on_material(self, event: AstrMessageEvent):
+        """Answer 材料 with a material archive page.
+
+        Args:
+            event: The message event carrying the material name.
+
+        Yields:
+            The rendered material page, or a short hint.
+        """
+        query = _MATERIAL_WORD.sub("", event.get_message_str(), count=1).strip()
+        if not query:
+            yield event.plain_result("请在「材料」后面跟上名称，例如：材料 炽合金")
+            return
+        try:
+            panel = await self.arknights.material_panel(query)
+            if panel is None:
+                entry = await self.arknights.match(query)
+                if entry is not None:
+                    panel = await self.arknights.operator_material_panel(entry)
+                    if panel:
+                        panel["operation"] = "material"
+                        image = await self._panel_image(self.arknights, entry, panel)
+                        yield event.image_result(image)
+                        return
+                yield event.plain_result(f"没有找到材料「{query}」")
+                return
+        except Exception as exc:  # noqa: BLE001 - never crash the event
+            self.logger.warning("material %s failed: %s", query, exc)
+            return
+        entry = GameDataEntry(
+            game="arknights",
+            category="material",
+            entry_id=str(panel.get("entry_id") or query),
+            title=str(panel.get("title") or query),
+        )
+        panel["operation"] = "material"
+        try:
+            image = await self._panel_image(self.arknights, entry, panel)
+        except Exception as exc:  # noqa: BLE001 - rendering must not crash
+            self.logger.warning("material page failed: %s", exc)
+            return
+        yield event.image_result(image)
+
     @filter.regex(r"^[^\s/]{1,32}$")
     async def on_single_name(self, event: AstrMessageEvent):
         """Answer a bare character name with the rendered character card.
@@ -745,6 +985,9 @@ class Main(star.Star):
             return
         text = event.get_message_str().strip()
         self.logger.debug("single-word lookup: %r", text)
+        if _MATERIAL_SUFFIX.match(text) or _SKILL_SUFFIX.match(text):
+            # ``迷迭香材料`` / ``迷迭香技能`` have their own handlers.
+            return
         for provider in (self.arknights, self.endfield):
             try:
                 entry = await provider.match(text)
@@ -798,6 +1041,48 @@ class Main(star.Star):
             if (event.get_platform_name() or "").startswith(_BUTTON_PLATFORMS):
                 yield _card_message(entry)
             return
+        # No operator carries that name; a material may still match, since the
+        # wake word already keeps unrelated chatter away.
+        try:
+            panel = await self.arknights.material_panel(text)
+        except (UpstreamError, LookupError, ValueError) as exc:
+            self.logger.warning("material lookup %r failed: %s", text, exc)
+            return
+        if panel:
+            item = GameDataEntry(
+                game="arknights",
+                category="material",
+                entry_id=str(panel.get("entry_id") or text),
+                title=str(panel.get("title") or text),
+            )
+            panel["operation"] = "material"
+            try:
+                image = await self._panel_image(self.arknights, item, panel)
+            except Exception as exc:  # noqa: BLE001 - never crash the event
+                self.logger.warning("material page %r failed: %s", text, exc)
+                return
+            yield event.image_result(image)
+            return
+        try:
+            skill_panel = await self.arknights.skill_panel(text)
+        except (UpstreamError, LookupError, ValueError) as exc:
+            self.logger.warning("skill lookup %r failed: %s", text, exc)
+            return
+        if skill_panel:
+            skill_panel["operation"] = "skill"
+            item = GameDataEntry(
+                game="arknights",
+                category="skill",
+                entry_id=str(skill_panel.get("entry_id") or text),
+                title=str(skill_panel.get("title") or text),
+            )
+            try:
+                image = await self._panel_image(self.arknights, item, skill_panel)
+            except Exception as exc:  # noqa: BLE001 - never crash the event
+                self.logger.warning("skill page %r failed: %s", text, exc)
+                return
+            yield event.image_result(image)
+            return
         self.logger.debug("no character matched %r", text)
 
     @filter.regex(_PANEL_WORD)
@@ -819,7 +1104,9 @@ class Main(star.Star):
         if remembered is None:
             return
         game, entry_id = remembered
-        word = event.get_message_str().strip().lstrip("/／").strip()
+        word = event.get_message_str().strip()
+        if word.startswith("干员"):
+            word = word[2:].strip()
         operation = _PANEL_WORDS.get(word)
         if not operation:
             return
