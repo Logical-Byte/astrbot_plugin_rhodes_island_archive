@@ -90,7 +90,7 @@ def _valid_png(body: bytes) -> bool:
 
 
 #: The keyword that opens the recruitment planner.
-_RECRUIT_KEYWORD = re.compile(r"^\s*(?:公招|公开招募)\s*")
+_RECRUIT_KEYWORD = re.compile(r"^(?:公招|公开招募)")
 
 #: How long the plugin keeps waiting for a recruitment screenshot.
 _RECRUIT_WAIT = 30.0
@@ -152,7 +152,7 @@ _PANEL_WORDS = {
 }
 
 #: Pattern for the sub-page words, with an optional command prefix.
-_PANEL_WORD = re.compile(r"^\s*(?:" + "|".join(_PANEL_WORDS) + r")\s*$")
+_PANEL_WORD = re.compile(r"^(?:" + "|".join(_PANEL_WORDS) + r")$")
 
 
 def _operator_buttons(entry: GameDataEntry) -> ActionRow:
@@ -633,7 +633,7 @@ class Main(star.Star):
             time.monotonic() + _RECRUIT_WAIT
         )
 
-    @filter.regex(r"^\s*(?:公招|公开招募)")
+    @filter.regex(r"^(?:公招|公开招募)")
     async def on_recruit(self, event: AstrMessageEvent):
         """Answer a recruitment request with the tag combination page.
 
@@ -718,7 +718,7 @@ class Main(star.Star):
         async for result in self._recruit_answer(event, tags):
             yield result
 
-    @filter.regex(r"^\s*[^\s/]{1,32}\s*$")
+    @filter.regex(r"^[^\s/]{1,32}$")
     async def on_single_name(self, event: AstrMessageEvent):
         """Answer a bare character name with the rendered character card.
 
