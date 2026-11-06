@@ -1,0 +1,27 @@
+{
+  "timeout": {
+    "description": "上游请求超时（秒）",
+    "type": "float",
+    "default": 20.0
+  },
+  "cache_ttl": {
+    "description": "缓存有效期（秒）：内存与磁盘共用，0 表示每次都用 HEAD 校验",
+    "type": "int",
+    "default": 600
+  },
+  "max_download_mb": {
+    "description": "单个资源下载大小上限（MB）",
+    "type": "int",
+    "default": 32
+  },
+  "user_agent": {
+    "description": "请求上游时使用的 User-Agent",
+    "type": "string",
+    "default": "astrbot-plugin-rhodes-island-archive/0.1"
+  },
+  "render_timeout": {
+    "description": "本地渲染超时（秒）；本地浏览器不可用时自动改用 AstrBot 的渲染服务",
+    "type": "float",
+    "default": 30.0
+  }
+}

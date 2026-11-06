@@ -1,0 +1,857 @@
+"""Entry point of the Rhodes Island Data Archive plugin."""
+
+import hashlib
+import os
+import re
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+from astrbot.api import star
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import ActionRow, Button, Image
+from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
+
+from .models import GameDataEntry
+from .providers.arknights import ArknightsProvider, match_recruit_tags
+from .providers.base import GameDataProvider
+from .providers.card import (
+    render_card,
+    render_panel,
+    render_recruit,
+    render_token_card,
+)
+from .providers.endfield import EndfieldProvider
+from .providers.net import DEFAULT_USER_AGENT, NetClient, UpstreamError
+from .providers.ocr import OCRError, recognize
+from .providers.render import LocalRenderer, browsers_dir
+
+#: Directory shipped with the plugin, holding the template font and texture.
+ASSETS_DIR = Path(__file__).parent / "assets"
+
+
+def _number(config: dict, key: str, default: float, cast: type) -> float:
+    """Read a numeric option, falling back to its default when invalid.
+
+    Args:
+        config: Plugin configuration mapping.
+        key: Option name.
+        default: Value used when the option is absent or unusable.
+        cast: Numeric type applied to the configured value.
+
+    Returns:
+        The parsed option value.
+    """
+    try:
+        return cast(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _store_image(body: bytes, target: Path) -> Path:
+    """Write a rendered image into the cache exactly as it was produced.
+
+    The image is stored untouched so later features can rely on the original
+    pixels.
+
+    Args:
+        body: Raw PNG bytes.
+        target: Destination path.
+
+    Returns:
+        The path of the stored image.
+
+    Raises:
+        OSError: If the cache file cannot be written.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # A unique temporary name keeps concurrent replies from clobbering.
+    tmp_path = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    tmp_path.write_bytes(body)
+    os.replace(tmp_path, target)
+    return target
+
+
+def _valid_png(body: bytes) -> bool:
+    """Tell a rendered card from an error page stored with a ``.png`` name.
+
+    A render backend replies with whatever bytes it has, so a gateway error can
+    be written to a ``.png`` as well. Such a body must never be sent or cached.
+
+    Args:
+        body: Bytes returned by the renderer.
+
+    Returns:
+        ``True`` when the payload carries a PNG signature and plausibly sized
+        content.
+    """
+    return body.startswith(b"\x89PNG\r\n\x1a\n") and len(body) > 8192
+
+
+#: The keyword that opens the recruitment planner.
+_RECRUIT_KEYWORD = re.compile(r"^\s*[/／]?\s*(?:公招|公开招募)\s*")
+
+#: Separators players use between tags.
+_TAG_SPLIT = re.compile(r"[\s,，、/|]+")
+
+#: Short forms mapped onto the tags the data uses.
+_TAG_ALIASES = {
+    "高资": "高级资深干员",
+    "高级资深": "高级资深干员",
+    "资深": "资深干员",
+}
+
+
+def _recruit_tags(text: str) -> list[str]:
+    """Extract recruitment tags from a message.
+
+    Args:
+        text: Message text, with or without the leading keyword.
+
+    Returns:
+        Known tags in the order they were typed, aliases resolved.
+    """
+    body = _RECRUIT_KEYWORD.sub("", text)
+    tags: list[str] = []
+    for token in _TAG_SPLIT.split(body):
+        token = token.strip()
+        if not token:
+            continue
+        tag = _TAG_ALIASES.get(token, token)
+        if tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+#: Buttons attached under a character card, as ``(operation, label)``.
+_OPERATOR_ACTIONS = (
+    ("module", "模组"),
+    ("skin", "皮肤"),
+    ("story", "档案"),
+    ("faction", "阵营"),
+    ("voice", "语音"),
+)
+
+#: Platforms that can render an inline keyboard under an image.
+_BUTTON_PLATFORMS = ("qq_official",)
+
+
+#: Words that open a sub-page of the operator card, mapped to their operation.
+_PANEL_WORDS = {
+    "模组": "module",
+    "皮肤": "skin",
+    "立绘": "skin",
+    "档案": "story",
+    "资料": "story",
+    "阵营": "faction",
+    "语音": "voice",
+}
+
+#: Pattern for the sub-page words, with an optional command prefix.
+_PANEL_WORD = re.compile(r"^\s*[/／]?\s*(?:" + "|".join(_PANEL_WORDS) + r")\s*$")
+
+
+def _operator_buttons(entry: GameDataEntry) -> ActionRow:
+    """Build the keyboard that rides inside the markdown card.
+
+    Args:
+        entry: The character the buttons belong to.
+
+    Returns:
+        One row with a button per operator sub-query.
+    """
+    return ActionRow(
+        buttons=[
+            Button(
+                id=f"ri_{operation}",
+                label=label,
+                style=Button.Style.SUCCESS,
+                action=Button.CallbackAction(
+                    data={"op": operation, "game": entry.game, "id": entry.entry_id}
+                ),
+            )
+            for operation, label in _OPERATOR_ACTIONS
+        ],
+        fallback_text="模组 皮肤 档案 阵营 语音",
+    )
+
+
+def _card_message(entry: GameDataEntry) -> MessageEventResult:
+    """Build the message that carries the button row under a character card.
+
+    Args:
+        entry: The character the card belongs to.
+
+    Returns:
+        A markdown message with one button per operator sub-query.
+    """
+    result = MessageEventResult().message(f"{entry.title} · 相关资料")
+    result.use_markdown(True)
+    result.chain.append(_operator_buttons(entry))
+    return result
+
+
+class Main(star.Star):
+    """Own the Arknights and Endfield providers for the plugin lifetime.
+
+    A single silent handler answers a bare character name that follows the
+    wake word. Anything that does not resolve to exactly one character
+    produces no output at all.
+    """
+
+    def __init__(self, context: star.Context, config: dict | None = None) -> None:
+        """Build the shared network client and both providers.
+
+        Args:
+            context: The AstrBot plugin context.
+            config: Plugin configuration parsed from ``_conf_schema.json``.
+        """
+        super().__init__(context, config)
+        config = config or {}
+        self._render_timeout = _number(config, "render_timeout", 30.0, float)
+        data_dir: Path | None = None
+        try:
+            data_dir = star.StarTools.get_data_dir(
+                "astrbot_plugin_rhodes_island_archive"
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            self.logger.warning("Disk cache unavailable, keeping memory only: %s", exc)
+        cache_dir = data_dir / "cache" if data_dir is not None else None
+        self.net = NetClient(
+            ("torappu.prts.wiki", "data.akedata.wiki"),
+            timeout=_number(config, "timeout", 20.0, float),
+            cache_ttl=_number(config, "cache_ttl", 600, float),
+            max_bytes=int(_number(config, "max_download_mb", 32, float) * 1024 * 1024),
+            user_agent=str(config.get("user_agent") or DEFAULT_USER_AGENT),
+            cache_dir=cache_dir,
+            logger=self.logger,
+        )
+        self.arknights = ArknightsProvider(self.net)
+        self.endfield = EndfieldProvider(self.net)
+        self._image_dir = cache_dir / "images" if cache_dir is not None else None
+        # QQ turns inline keyboard clicks into their label text, so remember
+        # which operator each session last looked up.
+        self._last_operator: dict[str, tuple[str, str]] = {}
+        self._renderer: LocalRenderer | None = None
+        self._renderer_ready = False
+        if data_dir is not None:
+            self._renderer = LocalRenderer(
+                ASSETS_DIR,
+                cache_dir / "render",
+                timeout=self._render_timeout,
+                browsers=browsers_dir(data_dir),
+                logger=self.logger,
+            )
+
+    async def _local_renderer(self) -> LocalRenderer | None:
+        """Start the local browser once, if this installation supports it.
+
+        Returns:
+            The running renderer, or ``None`` when Playwright or its Chromium
+            build is unavailable and the remote service has to be used.
+        """
+        if self._renderer is None or self._renderer_ready:
+            return self._renderer
+        self._renderer_ready = True
+        try:
+            await self._renderer.start()
+        except Exception as exc:  # noqa: BLE001 - any failure means "fallback"
+            self.logger.warning(
+                "local renderer unavailable, falling back to the AstrBot service: "
+                "%s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            self._renderer = None
+        return self._renderer
+
+    async def _remote_render(self, html: str, entry: GameDataEntry) -> bytes:
+        """Render through the AstrBot text-to-image service.
+
+        Args:
+            html: Complete HTML document.
+            entry: The character being rendered, used for logging.
+
+        Returns:
+            The rendered PNG bytes.
+
+        Raises:
+            UpstreamError: If the service never returns a usable PNG.
+        """
+        started = time.monotonic()
+        # The render service occasionally answers with a gateway error page or
+        # times out; one retry covers those, anything else is reported.
+        for attempt in (1, 2):
+            try:
+                path = await self.context.html_renderer.render_custom_template(
+                    html,
+                    {},
+                    return_url=False,
+                    options={"full_page": True, "type": "png"},
+                )
+                body = Path(path).read_bytes()
+            except Exception as exc:
+                # The render service fails in opaque ways (timeout, 502, reset),
+                # so the payload size is logged with the error.
+                self.logger.warning(
+                    "card %s/%s: render attempt %d failed after %.2fs, "
+                    "html %d bytes: %s: %s",
+                    entry.game,
+                    entry.entry_id,
+                    attempt,
+                    time.monotonic() - started,
+                    len(html),
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+                if attempt == 2:
+                    raise
+                continue
+            if _valid_png(body):
+                return body
+            self.logger.warning(
+                "card %s/%s: render attempt %d returned %d bytes that are not "
+                "a PNG: %r",
+                entry.game,
+                entry.entry_id,
+                attempt,
+                len(body),
+                body[:120],
+            )
+        raise UpstreamError("Render service returned no usable PNG")
+
+    async def _render(
+        self,
+        html: str,
+        entry: GameDataEntry,
+        *,
+        size: tuple[int, int] | None = None,
+    ) -> bytes:
+        """Render the card, preferring the local browser.
+
+        Args:
+            html: Complete HTML document.
+            entry: The character being rendered, used for logging.
+            size: Optional viewport size for pages that are not 1400x900.
+
+        Returns:
+            The rendered PNG bytes.
+        """
+        renderer = await self._local_renderer()
+        if renderer is not None:
+            started = time.monotonic()
+            try:
+                body = await renderer.render(
+                    html, **(dict(zip(("width", "height"), size)) if size else {})
+                )
+                if _valid_png(body):
+                    self.logger.debug(
+                        "card %s/%s: local render in %.2fs",
+                        entry.game,
+                        entry.entry_id,
+                        time.monotonic() - started,
+                    )
+                    return body
+                self.logger.warning(
+                    "card %s/%s: local render returned %d bytes that are not a PNG",
+                    entry.game,
+                    entry.entry_id,
+                    len(body),
+                )
+            except Exception as exc:  # noqa: BLE001 - fall back to the service
+                self.logger.warning(
+                    "card %s/%s: local render failed after %.2fs: %s: %s",
+                    entry.game,
+                    entry.entry_id,
+                    time.monotonic() - started,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+        return await self._remote_render(html, entry)
+
+    async def _card_image(
+        self, provider: GameDataProvider, entry: GameDataEntry
+    ) -> str:
+        """Render the character card and return the PNG path to send.
+
+        The rendered PNG is cached per character so a repeated lookup skips
+        both the table reads and the rendering itself.
+
+        Args:
+            provider: Provider that owns the character.
+            entry: The matched character.
+
+        Returns:
+            Path of the rendered PNG.
+
+        Raises:
+            UpstreamError: If no backend produced a usable PNG.
+            OSError: If the rendered file cannot be read or written.
+        """
+        target = None
+        if self._image_dir is not None:
+            # The version prefix invalidates cards rendered by older layouts.
+            target = self._image_dir / f"card_v16_{entry.game}_{entry.entry_id}.png"
+            if target.is_file():
+                cached = target.read_bytes()
+                if _valid_png(cached):
+                    self.logger.info(
+                        "card %s/%s: cache hit %s (%d bytes)",
+                        entry.game,
+                        entry.entry_id,
+                        target.name,
+                        len(cached),
+                    )
+                    return str(target)
+                self.logger.warning(
+                    "card %s/%s: dropping invalid cache %s (%d bytes: %r)",
+                    entry.game,
+                    entry.entry_id,
+                    target.name,
+                    len(cached),
+                    cached[:80],
+                )
+                target.unlink(missing_ok=True)
+
+        started = time.monotonic()
+        self.logger.info("card %s/%s: collecting data", entry.game, entry.entry_id)
+        card = await provider.card(entry)
+        collected = time.monotonic()
+        self.logger.debug(
+            "card %s/%s: art inlined=%s skills=%d devices=%d",
+            entry.game,
+            entry.entry_id,
+            bool(card.get("art")),
+            len(card.get("skills") or []),
+            len(card.get("devices") or []),
+        )
+
+        renderer = await self._local_renderer()
+        html = render_card(card, font=renderer.font_family if renderer else None)
+        rendered_started = time.monotonic()
+        body = await self._render(html, entry)
+        rendered = time.monotonic()
+        self.logger.info(
+            "card %s/%s: data %.2fs, html %.0f KB, render %.2fs, png %.0f KB",
+            entry.game,
+            entry.entry_id,
+            collected - started,
+            len(html) / 1024,
+            rendered - rendered_started,
+            len(body) / 1024,
+        )
+        if target is None:
+            # Without a data directory the image still has to exist on disk for
+            # the platform layer to upload it, so it goes to the temp directory.
+            self.logger.debug(
+                "card %s/%s: no cache dir, returning temp file",
+                entry.game,
+                entry.entry_id,
+            )
+            target = Path(tempfile.gettempdir()) / f"card_{entry.entry_id}.png"
+        return str(_store_image(body, target))
+
+    async def _token_image(
+        self, provider: GameDataProvider, entry: GameDataEntry
+    ) -> str | None:
+        """Render the separate device page of one character.
+
+        Args:
+            provider: Provider that owns the character.
+            entry: The matched character.
+
+        Returns:
+            Path of the rendered PNG, or ``None`` when the character deploys
+            no device or the page cannot be produced.
+        """
+        target = None
+        if self._image_dir is not None:
+            target = self._image_dir / f"token_v2_{entry.game}_{entry.entry_id}.png"
+            if target.is_file():
+                cached = target.read_bytes()
+                if _valid_png(cached):
+                    self.logger.info(
+                        "token page %s/%s: cache hit %s (%d bytes)",
+                        entry.game,
+                        entry.entry_id,
+                        target.name,
+                        len(cached),
+                    )
+                    return str(target)
+                target.unlink(missing_ok=True)
+
+        started = time.monotonic()
+        page = await provider.token_card(entry)
+        if not page:
+            return None
+        renderer = await self._local_renderer()
+        html = render_token_card(page, font=renderer.font_family if renderer else None)
+        body = await self._render(html, entry, size=(1280, 720))
+        self.logger.info(
+            "token page %s/%s: %d device(s), html %.0f KB, png %.0f KB in %.2fs",
+            entry.game,
+            entry.entry_id,
+            len(page.get("tokens") or []),
+            len(html) / 1024,
+            len(body) / 1024,
+            time.monotonic() - started,
+        )
+        if target is None:
+            target = Path(tempfile.gettempdir()) / f"token_{entry.entry_id}.png"
+        return str(_store_image(body, target))
+
+    async def _first_image(self, event: AstrMessageEvent) -> str | None:
+        """Return the local path of the first image in one message.
+
+        Args:
+            event: The message event to inspect.
+
+        Returns:
+            Absolute file path, or ``None`` when the message carries no image.
+        """
+        for component in event.get_messages():
+            if isinstance(component, Image):
+                try:
+                    return await component.convert_to_file_path()
+                except Exception as exc:  # noqa: BLE001 - download may fail
+                    self.logger.warning("image download failed: %s", exc)
+                    return None
+        return None
+
+    async def _recruit_image(self, page: dict[str, Any]) -> str:
+        """Render the recruitment result page, reusing cached images.
+
+        Args:
+            page: Result mapping from ``ArknightsProvider.recruit``.
+
+        Returns:
+            Path of the rendered PNG.
+        """
+        key = hashlib.sha1(
+            "|".join(sorted(page.get("tags") or [])).encode("utf-8")
+        ).hexdigest()[:16]
+        target = None
+        if self._image_dir is not None:
+            target = self._image_dir / f"recruit_{key}.png"
+            if target.is_file():
+                body = target.read_bytes()
+                if _valid_png(body):
+                    self.logger.info(
+                        "recruit %s: cache hit %s (%d bytes)",
+                        key,
+                        target.name,
+                        len(body),
+                    )
+                    return str(target)
+                target.unlink(missing_ok=True)
+
+        renderer = await self._local_renderer()
+        html = render_recruit(page, font=renderer.font_family if renderer else None)
+        started = time.monotonic()
+        body = await self._render(
+            html, GameDataEntry("arknights", "recruit", key, key), size=(1280, 720)
+        )
+        self.logger.info(
+            "recruit %s: %d group(s), html %.0f KB, png %.0f KB in %.2fs",
+            key,
+            len(page.get("groups") or []),
+            len(html) / 1024,
+            len(body) / 1024,
+            time.monotonic() - started,
+        )
+        if target is None:
+            path = Path(tempfile.gettempdir()) / f"recruit_{key}.png"
+            path.write_bytes(body)
+            return str(path)
+        return str(_store_image(body, target))
+
+    @filter.regex(r"^\s*[/／]?\s*(?:公招|公开招募)")
+    async def on_recruit(self, event: AstrMessageEvent):
+        """Answer a recruitment request with the tag combination page.
+
+        Args:
+            event: The message event carrying the tags.
+
+        Yields:
+            The rendered page, or a short hint when no tag was recognised.
+        """
+        if not event.is_at_or_wake_command:
+            return
+        tags = _recruit_tags(event.get_message_str())
+        if not tags:
+            image_path = await self._first_image(event)
+            if image_path is None:
+                yield event.plain_result(
+                    "请在「公招」后面跟上标签，或者直接发公招界面截图，例如：公招 资深 输出"
+                )
+                return
+            try:
+                text = await recognize(image_path)
+                tags = match_recruit_tags(
+                    text, await self.arknights.recruit_vocabulary()
+                )
+            except OCRError as exc:
+                self.logger.warning("recruit OCR failed: %s", exc)
+                yield event.plain_result("图片识别失败")
+                return
+            self.logger.info("recruit OCR text: %r -> %s", text, tags)
+            if not tags:
+                yield event.plain_result("博士，没有在图内找到标签信息")
+                return
+        try:
+            page = await self.arknights.recruit(tags)
+        except Exception as exc:  # noqa: BLE001 - never crash the event
+            self.logger.warning(
+                "recruit %s failed: %s: %s", tags, type(exc).__name__, exc
+            )
+            return
+        if not page.get("candidates"):
+            yield event.plain_result("博士，无法查询到标签所拥有的稀有干员")
+            return
+        if not page.get("groups"):
+            yield event.plain_result("博士，没有找到可以锁定稀有干员的组合")
+            return
+        try:
+            image = await self._recruit_image(page)
+        except Exception as exc:  # noqa: BLE001 - rendering must not crash
+            self.logger.warning(
+                "recruit render failed: %s: %s", type(exc).__name__, exc
+            )
+            return
+        yield event.image_result(image)
+
+    @filter.regex(r"^\s*[^\s/]{1,32}\s*$")
+    async def on_single_name(self, event: AstrMessageEvent):
+        """Answer a bare character name with the rendered character card.
+
+        The handler stays silent unless the wake word was used and exactly one
+        character matched, so unrelated single-word messages never get a
+        reply.
+
+        Args:
+            event: The message event that triggered the handler.
+
+        Yields:
+            The card image, or nothing when the lookup or the rendering fails.
+        """
+        if not event.is_at_or_wake_command:
+            return
+        text = event.get_message_str().strip()
+        self.logger.debug("single-word lookup: %r", text)
+        for provider in (self.arknights, self.endfield):
+            try:
+                entry = await provider.match(text)
+            except (UpstreamError, LookupError, ValueError) as exc:
+                self.logger.warning(
+                    "lookup %r failed in %s: %s: %s",
+                    text,
+                    provider.game,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+                return
+            if entry is None:
+                continue
+            self.logger.debug("matched %r -> %s/%s", text, entry.game, entry.entry_id)
+            try:
+                image = await self._card_image(provider, entry)
+            except Exception as exc:  # noqa: BLE001 - never crash the event
+                # Rendering can fail with transport errors, plugin exceptions or
+                # anything a render backend raises; the handler stays silent
+                # but the reason is always logged.
+                self.logger.warning(
+                    "card for %s/%s failed: %s: %s",
+                    entry.game,
+                    entry.entry_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+                return
+            try:
+                token_image = await self._token_image(provider, entry)
+            except Exception as exc:  # noqa: BLE001 - device page is optional
+                self.logger.warning(
+                    "token page for %s/%s failed: %s: %s",
+                    entry.game,
+                    entry.entry_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+                token_image = None
+            key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
+            self._last_operator[key] = (entry.game, entry.entry_id)
+            if (event.get_platform_name() or "").startswith(_BUTTON_PLATFORMS):
+                # QQ cannot carry a picture and a keyboard in one message, and a
+                # markdown reply poisons the following picture send, so the card
+                # (and the device page) go out on their own and the buttons ride
+                # a second message.
+                sent = await self.context.send_message(
+                    event.unified_msg_origin, MessageChain(chain=[Image(file=image)])
+                )
+                if sent:
+                    if token_image:
+                        await self.context.send_message(
+                            event.unified_msg_origin,
+                            MessageChain(chain=[Image(file=token_image)]),
+                        )
+                    yield _card_message(entry)
+                    return
+            yield event.image_result(image)
+            if token_image:
+                yield event.image_result(token_image)
+            if token_image:
+                yield event.image_result(token_image)
+            return
+        self.logger.debug("no character matched %r", text)
+
+    @filter.regex(_PANEL_WORD)
+    async def on_panel_word(self, event: AstrMessageEvent):
+        """Answer 模组 / 皮肤 / 档案 / 阵营 / 语音 for the last shown operator.
+
+        QQ turns inline keyboard clicks into their label text instead of a
+        callback, so the same pages are reachable by typing the word right after
+        a character card was shown.
+
+        Args:
+            event: The message event that triggered the handler.
+
+        Yields:
+            The rendered sub-page, or nothing when no operator was shown yet.
+        """
+        key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
+        remembered = self._last_operator.get(key)
+        if remembered is None:
+            return
+        game, entry_id = remembered
+        word = event.get_message_str().strip().lstrip("/／").strip()
+        operation = _PANEL_WORDS.get(word)
+        if not operation:
+            return
+        provider = self.arknights if game == "arknights" else self.endfield
+        collector = f"{operation}_panel"
+        try:
+            entry = await provider.get_detail(entry_id)
+            panel = await getattr(provider, collector)(entry)
+            if not panel:
+                yield event.plain_result(f"{entry.title} 没有{word}数据")
+                return
+            panel["operation"] = operation
+            image = await self._panel_image(provider, entry, panel)
+        except Exception as exc:  # noqa: BLE001 - never crash the event
+            self.logger.warning(
+                "panel %s/%s/%s failed: %s: %s",
+                game,
+                operation,
+                entry_id,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            return
+        yield event.image_result(image)
+
+    async def _panel_image(
+        self, provider: GameDataProvider, entry: GameDataEntry, panel: dict[str, Any]
+    ) -> str:
+        """Render one operator sub-page and cache the PNG.
+
+        Args:
+            provider: Provider that owns the character.
+            entry: The character the page belongs to.
+            panel: Panel data returned by the provider.
+
+        Returns:
+            Path of the rendered PNG.
+
+        Raises:
+            UpstreamError: If no render backend produced a usable PNG.
+            OSError: If the rendered file cannot be read or written.
+        """
+        operation = str(panel.get("operation") or "panel")
+        target = None
+        if self._image_dir is not None:
+            target = (
+                self._image_dir
+                / f"panel_v1_{entry.game}_{operation}_{entry.entry_id}.png"
+            )
+            if target.is_file():
+                cached = target.read_bytes()
+                if _valid_png(cached):
+                    return str(target)
+                self.logger.warning("panel %s: dropping invalid cache", target.name)
+                target.unlink(missing_ok=True)
+        renderer = await self._local_renderer()
+        html = render_panel(panel, font=renderer.font_family if renderer else None)
+        body = await self._render(html, entry, size=(1280, 720))
+        if target is None:
+            path = Path(tempfile.gettempdir()) / f"panel_{entry.entry_id}.png"
+            path.write_bytes(body)
+            return str(path)
+        return str(_store_image(body, target))
+
+    @filter.button_action()
+    async def on_operator_button(self, event: AstrMessageEvent):
+        """Answer one of the buttons attached under a character card.
+
+        Args:
+            event: The button click event.
+
+        Yields:
+            The rendered sub-page, or nothing when the operation is unknown.
+        """
+        interaction = event.get_button_interaction()
+        data = interaction.data if interaction is not None else None
+        if not isinstance(data, dict):
+            return
+        operation = str(data.get("op") or "")
+        game = str(data.get("game") or "")
+        entry_id = str(data.get("id") or "")
+        collector = {
+            "module": "module_panel",
+            "skin": "skin_panel",
+            "story": "story_panel",
+            "faction": "faction_panel",
+            "voice": "voice_panel",
+        }.get(operation)
+        if not collector or not entry_id:
+            return
+        provider = self.arknights if game == "arknights" else self.endfield
+        try:
+            entry = await provider.get_detail(entry_id)
+            panel = await getattr(provider, collector)(entry)
+            if not panel:
+                yield event.plain_result(f"{entry.title} 没有{operation}数据")
+                return
+            panel["operation"] = operation
+            image = await self._panel_image(provider, entry, panel)
+        except Exception as exc:  # noqa: BLE001 - never crash the event
+            self.logger.warning(
+                "panel %s/%s/%s failed: %s: %s",
+                game,
+                operation,
+                entry_id,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            return
+        # QQ drops the media of an interaction reply, so the page is pushed as a
+        # fresh message instead of being answered inline.
+        sent = await self.context.send_message(
+            event.unified_msg_origin, MessageChain(chain=[Image(file=image)])
+        )
+        if not sent:
+            yield event.plain_result(f"{entry.title} · {operation}")
+
+    async def terminate(self) -> None:
+        """Release the browser and the HTTP client on disable or reload."""
+        if self._renderer is not None:
+            await self._renderer.close()
+            self._renderer = None
+        await self.net.aclose()
