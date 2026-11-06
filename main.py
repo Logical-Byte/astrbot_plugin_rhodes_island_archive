@@ -693,8 +693,6 @@ class Main(star.Star):
                 yield event.image_result(token_image)
             if (event.get_platform_name() or "").startswith(_BUTTON_PLATFORMS):
                 yield _card_message(entry)
-            if token_image:
-                yield event.image_result(token_image)
             return
         self.logger.debug("no character matched %r", text)
 
