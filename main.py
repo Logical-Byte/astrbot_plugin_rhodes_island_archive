@@ -90,7 +90,11 @@ def _valid_png(body: bytes) -> bool:
 
 
 #: The keyword that opens the recruitment planner.
-_RECRUIT_KEYWORD = re.compile(r"^(?:公招|公开招募)")
+#: Words that open a recruitment query; the last two double as the tag.
+_RECRUIT_KEYWORD = re.compile(r"^(?:公开招募|公招|高资|高姿)")
+
+#: Trigger words that also stand for the 高级资深干员 tag.
+_RECRUIT_LEAD_TAGS = {"高资": "高级资深干员", "高姿": "高级资深干员"}
 
 #: How long the plugin keeps waiting for a recruitment screenshot.
 _RECRUIT_WAIT = 30.0
@@ -101,6 +105,7 @@ _TAG_SPLIT = re.compile(r"[\s,，、/|]+")
 #: Short forms mapped onto the tags the data uses.
 _TAG_ALIASES = {
     "高资": "高级资深干员",
+    "高姿": "高级资深干员",
     "高级资深": "高级资深干员",
     "资深": "资深干员",
 }
@@ -115,8 +120,12 @@ def _recruit_tags(text: str) -> list[str]:
     Returns:
         Known tags in the order they were typed, aliases resolved.
     """
-    body = _RECRUIT_KEYWORD.sub("", text)
+    match = _RECRUIT_KEYWORD.match(text)
+    body = _RECRUIT_KEYWORD.sub("", text, count=1)
     tags: list[str] = []
+    lead = _RECRUIT_LEAD_TAGS.get(match.group(0)) if match else None
+    if lead:
+        tags.append(lead)
     for token in _TAG_SPLIT.split(body):
         token = token.strip()
         if not token:
@@ -633,7 +642,7 @@ class Main(star.Star):
             time.monotonic() + _RECRUIT_WAIT
         )
 
-    @filter.regex(r"^(?:公招|公开招募)")
+    @filter.regex(r"^(?:公开招募|公招|高资|高姿)")
     async def on_recruit(self, event: AstrMessageEvent):
         """Answer a recruitment request with the tag combination page.
 
