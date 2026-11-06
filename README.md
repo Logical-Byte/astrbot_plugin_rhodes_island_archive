@@ -304,3 +304,13 @@ card for arknights/char_391_rosmon failed: TimeoutError: render service timed ou
 ## 待办
 
 - [ ] 指令层与 `views/` 可视化页面
+
+## 版本号
+
+每次改动都必须同时提升 `metadata.yaml` 的 `version`，并在提交信息里注明升到哪个版本：
+
+| 变更类型 | 版本位 |
+|---|---|
+| 修 bug、调文案 | 末位 +1（1.2.3 → 1.2.4） |
+| 新功能、新面板 | 中位 +1（1.2.3 → 1.3.0） |
+| 破坏性改动、配置项重命名 | 首位 +1（1.2.3 → 2.0.0） |

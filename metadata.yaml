@@ -6,7 +6,7 @@ desc: |
 
   唤醒词后只跟一个角色名时，命中后回复一张角色卡片图片（数值、档案、
   潜能、天赋、基建技能、技能、装置与立绘）；未命中不回复。
-version: 0.1.0
+version: 0.2.0
 author: "Logical-Byte"
 repo: "https://github.com/Logical-Byte/astrbot_plugin_rhodes_island_archive"
 astrbot_version: ">=4.29.0"
