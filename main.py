@@ -99,6 +99,9 @@ _RECRUIT_LEAD_TAGS = {"高资": "高级资深干员", "高姿": "高级资深干
 #: How long the plugin keeps waiting for a recruitment screenshot.
 _RECRUIT_WAIT = 30.0
 
+#: How long a character card keeps answering its sub-query buttons.
+_CARD_TTL = 300.0
+
 #: Separators players use between tags.
 _TAG_SPLIT = re.compile(r"[\s,，、/|]+")
 
@@ -198,7 +201,12 @@ def _operator_buttons(entry: GameDataEntry) -> ActionRow:
                 label=label,
                 style=Button.Style.SUCCESS,
                 action=Button.CallbackAction(
-                    data={"op": operation, "game": entry.game, "id": entry.entry_id}
+                    data={
+                        "op": operation,
+                        "game": entry.game,
+                        "id": entry.entry_id,
+                        "ts": int(time.time()),
+                    }
                 ),
             )
             for operation, label in _OPERATOR_ACTIONS
@@ -261,8 +269,8 @@ class Main(star.Star):
         self.endfield = EndfieldProvider(self.net)
         self._image_dir = cache_dir / "images" if cache_dir is not None else None
         # QQ turns inline keyboard clicks into their label text, so remember
-        # which operator each session last looked up.
-        self._last_operator: dict[str, tuple[str, str]] = {}
+        # which operator each session last looked up, and when.
+        self._last_operator: dict[str, tuple[str, str, float]] = {}
         # Sessions that asked for a recruitment screenshot, with the
         # monotonic deadline of their waiting window.
         self._pending_recruit: dict[str, float] = {}
@@ -766,7 +774,7 @@ class Main(star.Star):
                     return
             else:
                 key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
-                remembered = self._last_operator.get(key)
+                remembered = self._remembered(key)
                 if remembered is None:
                     yield event.plain_result(
                         "请在「干员材料」后面跟上干员名，例如：干员材料 迷迭香"
@@ -1032,7 +1040,7 @@ class Main(star.Star):
                 )
                 token_image = None
             key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
-            self._last_operator[key] = (entry.game, entry.entry_id)
+            self._last_operator[key] = (entry.game, entry.entry_id, time.time())
             # Pictures first: a markdown reply resets the platform send buffer and
             # would make the following picture fail with "无效 markdown content".
             yield event.image_result(image)
@@ -1085,6 +1093,26 @@ class Main(star.Star):
             return
         self.logger.debug("no character matched %r", text)
 
+    def _remembered(self, key: str) -> tuple[str, str] | None:
+        """Return the operator a session last looked up, if still fresh.
+
+        Args:
+            key: Session key the lookup was remembered under.
+
+        Returns:
+            ``(game, entry_id)`` while the card is younger than ``_CARD_TTL``;
+            an expired entry is dropped and ``None`` is returned.
+        """
+        remembered = self._last_operator.get(key)
+        if remembered is None:
+            return None
+        game, entry_id, stamped_at = remembered
+        if time.time() - stamped_at > _CARD_TTL:
+            self._last_operator.pop(key, None)
+            self.logger.debug("card context for %s expired", key)
+            return None
+        return game, entry_id
+
     @filter.regex(_PANEL_WORD)
     async def on_panel_word(self, event: AstrMessageEvent):
         """Answer 模组 / 皮肤 / 档案 / 阵营 / 语音 for the last shown operator.
@@ -1100,7 +1128,7 @@ class Main(star.Star):
             The rendered sub-page, or nothing when no operator was shown yet.
         """
         key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
-        remembered = self._last_operator.get(key)
+        remembered = self._remembered(key)
         if remembered is None:
             return
         game, entry_id = remembered
@@ -1185,6 +1213,13 @@ class Main(star.Star):
         interaction = event.get_button_interaction()
         data = interaction.data if interaction is not None else None
         if not isinstance(data, dict):
+            return
+        try:
+            issued_at = float(data.get("ts") or 0)
+        except (TypeError, ValueError):
+            issued_at = 0.0
+        if issued_at <= 0 or time.time() - issued_at > _CARD_TTL:
+            self.logger.debug("ignoring stale card button: %s", data)
             return
         operation = str(data.get("op") or "")
         game = str(data.get("game") or "")

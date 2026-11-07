@@ -84,6 +84,8 @@ astrbot_plugin_rhodes_island_archive/
 
 干员卡之后跟一条按钮消息，五个按钮：**模组 / 皮肤 / 档案 / 阵营 / 语音**。也可以直接在群里发这五个词，插件按最近出卡的干员出图。
 
+按钮与这五个词只在干员卡发出后的 **5 分钟**内有效；超时后点击不再响应，重新查一次干员即可刷新。
+
 | 子页面 | 版式 | 来源 |
 | --- | --- | --- |
 | 模组 | 名称、类型、Lv1–3 加成、描述 | `uniequip_table.charEquip` → `equipDict`，加成在 `battle_equip_table[].phases[].attributeBlackboard` |
