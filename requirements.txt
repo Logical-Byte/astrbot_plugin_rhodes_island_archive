@@ -1,9 +1,2 @@
-# Local card rendering drives a headless Chromium through Playwright.
-# The browser binary is not a pip package; install it once with:
-#   python -m playwright install chromium
-playwright>=1.40
-
-# Local OCR for recruitment screenshots (ONNX runtime + PP-OCR models).
-# Without it the plugin still loads; the screenshot path reports the missing
-# dependency instead of failing.
+# Local OCR for recruitment screenshots.
 rapidocr-onnxruntime>=1.3

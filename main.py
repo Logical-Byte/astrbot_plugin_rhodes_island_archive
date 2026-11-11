@@ -1,1277 +1,841 @@
-"""Entry point of the Rhodes Island Data Archive plugin."""
+"""MCP-backed game-data queries for the Rhodes Island Data Archive."""
 
-import hashlib
-import os
+from __future__ import annotations
+
+import json
+import math
 import re
-import tempfile
 import time
-from pathlib import Path
+from difflib import SequenceMatcher
 from typing import Any
+from urllib.parse import quote, urlsplit
+
+import httpx
+from PIL import ImageFile
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import ActionRow, Button, Image
-from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
+from astrbot.core.message.message_event_result import MessageEventResult
 
-from .models import GameDataEntry
-from .providers.arknights import ArknightsProvider, match_recruit_tags
-from .providers.base import GameDataProvider
-from .providers.card import (
-    render_card,
-    render_panel,
-    render_recruit,
-    render_token_card,
-)
-from .providers.endfield import EndfieldProvider
-from .providers.net import DEFAULT_USER_AGENT, NetClient, UpstreamError
+from .commands import COMMANDS, SUFFIX_PATTERN
+from .providers.mcp import MCPError, MCPGateway
 from .providers.ocr import OCRError, recognize
-from .providers.render import LocalRenderer, browsers_dir
 
-#: Directory shipped with the plugin, holding the template font and texture.
-ASSETS_DIR = Path(__file__).parent / "assets"
-
-
-def _number(config: dict, key: str, default: float, cast: type) -> float:
-    """Read a numeric option, falling back to its default when invalid.
-
-    Args:
-        config: Plugin configuration mapping.
-        key: Option name.
-        default: Value used when the option is absent or unusable.
-        cast: Numeric type applied to the configured value.
-
-    Returns:
-        The parsed option value.
-    """
-    try:
-        return cast(config.get(key, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _store_image(body: bytes, target: Path) -> Path:
-    """Write a rendered image into the cache exactly as it was produced.
-
-    The image is stored untouched so later features can rely on the original
-    pixels.
-
-    Args:
-        body: Raw PNG bytes.
-        target: Destination path.
-
-    Returns:
-        The path of the stored image.
-
-    Raises:
-        OSError: If the cache file cannot be written.
-    """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # A unique temporary name keeps concurrent replies from clobbering.
-    tmp_path = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    tmp_path.write_bytes(body)
-    os.replace(tmp_path, target)
-    return target
-
-
-def _valid_png(body: bytes) -> bool:
-    """Tell a rendered card from an error page stored with a ``.png`` name.
-
-    A render backend replies with whatever bytes it has, so a gateway error can
-    be written to a ``.png`` as well. Such a body must never be sent or cached.
-
-    Args:
-        body: Bytes returned by the renderer.
-
-    Returns:
-        ``True`` when the payload carries a PNG signature and plausibly sized
-        content.
-    """
-    return body.startswith(b"\x89PNG\r\n\x1a\n") and len(body) > 8192
-
-
-#: The keyword that opens the recruitment planner.
-#: Words that open a recruitment query; the last two double as the tag.
-_RECRUIT_KEYWORD = re.compile(r"^(?:公开招募|公招|高资|高姿)")
-
-#: Trigger words that also stand for the 高级资深干员 tag.
-_RECRUIT_LEAD_TAGS = {"高资": "高级资深干员", "高姿": "高级资深干员"}
-
-#: How long the plugin keeps waiting for a recruitment screenshot.
-_RECRUIT_WAIT = 30.0
-
-#: How long a character card keeps answering its sub-query buttons.
+_DEFAULT_MCP_URL = "http://bd4wxr.top:40317/mcp"
 _CARD_TTL = 300.0
-
-#: Separators players use between tags.
+_RECRUIT_WAIT = 30.0
+_RECRUIT_KEYWORD = re.compile(r"^(公开招募|公招|高资|高姿)")
+_DISABLED_PREFIXES = ("终末地",)
 _TAG_SPLIT = re.compile(r"[\s,，、/|]+")
-
-#: Short forms mapped onto the tags the data uses.
 _TAG_ALIASES = {
     "高资": "高级资深干员",
     "高姿": "高级资深干员",
     "高级资深": "高级资深干员",
     "资深": "资深干员",
 }
+_PROFESSIONS = ("近卫", "狙击", "重装", "医疗", "辅助", "术师", "特种", "先锋")
+_SELECTION = re.compile(r"^选择\s*(\d{1,2})$")
 
 
-def _recruit_tags(text: str) -> list[str]:
-    """Extract recruitment tags from a message.
+class _QueryFilter(filter.CustomFilter):
+    """Keep ordinary non-wake messages from activating the query handler."""
 
-    Args:
-        text: Message text, with or without the leading keyword.
+    def filter(self, event: AstrMessageEvent, cfg: Any) -> bool:
+        """Accept wake-prefixed queries and explicit card follow-ups.
 
-    Returns:
-        Known tags in the order they were typed, aliases resolved.
-    """
-    match = _RECRUIT_KEYWORD.match(text)
-    body = _RECRUIT_KEYWORD.sub("", text, count=1)
-    tags: list[str] = []
-    lead = _RECRUIT_LEAD_TAGS.get(match.group(0)) if match else None
-    if lead:
-        tags.append(lead)
-    for token in _TAG_SPLIT.split(body):
-        token = token.strip()
-        if not token:
-            continue
-        tag = _TAG_ALIASES.get(token, token)
-        if tag not in tags:
-            tags.append(tag)
-    return tags
+        Args:
+            event: Incoming message event.
+            cfg: AstrBot configuration.
+
+        Returns:
+            Whether the query handler should be activated.
+        """
+        del cfg
+        text = event.get_message_str().strip()
+        return (
+            event.is_at_or_wake_command
+            or bool(_SELECTION.fullmatch(text))
+            or text in {"模组", "皮肤", "材料", "召唤物"}
+        )
 
 
-#: Buttons attached under a character card, as ``(operation, label)``.
-_OPERATOR_ACTIONS = (
-    ("module", "模组"),
-    ("skin", "皮肤"),
-    ("story", "档案"),
-    ("faction", "阵营"),
-    ("voice", "语音"),
-)
+class _ImageFilter(filter.CustomFilter):
+    """Limit the screenshot listener to events that actually contain an image."""
 
-#: Platforms that can render an inline keyboard under an image.
-_BUTTON_PLATFORMS = ("qq_official",)
+    def filter(self, event: AstrMessageEvent, cfg: Any) -> bool:
+        """Identify image messages without intercepting other chat messages.
 
+        Args:
+            event: Incoming message event.
+            cfg: AstrBot configuration.
 
-#: Words that open a sub-page of the operator card, mapped to their operation.
-_PANEL_WORDS = {
-    "模组": "module",
-    "皮肤": "skin",
-    "立绘": "skin",
-    "档案": "story",
-    "资料": "story",
-    "阵营": "faction",
-    "语音": "voice",
-}
-
-#: Pattern for the sub-page words; the 干员 prefix is optional.
-_PANEL_WORD = re.compile(r"^(?:干员\s*)?(?:" + "|".join(_PANEL_WORDS) + r")$")
-
-#: Material archive query, e.g. ``材料 炽合金``.
-_MATERIAL_WORD = re.compile(r"^材料\s*")
-
-#: Operator material query, e.g. ``干员材料 迷迭香``.
-_OPERATOR_MATERIAL_WORD = re.compile(r"^干员\s*材料\s*")
-
-#: Suffix form, e.g. ``迷迭香材料``.
-_MATERIAL_SUFFIX = re.compile(r"^([^\s/]{1,24})材料$")
-
-#: Skill archive query, e.g. ``技能 思维膨大``.
-_SKILL_WORD = re.compile(r"^技能\s*")
-
-#: Operator skill query, e.g. ``干员技能 迷迭香``.
-_OPERATOR_SKILL_WORD = re.compile(r"^干员\s*技能\s*")
-
-#: Suffix form, e.g. ``迷迭香技能``.
-_SKILL_SUFFIX = re.compile(r"^([^\s/]{1,24})技能$")
+        Returns:
+            Whether the event contains an image component.
+        """
+        del cfg
+        return any(isinstance(component, Image) for component in event.get_messages())
 
 
-def _operator_buttons(entry: GameDataEntry) -> ActionRow:
-    """Build the keyboard that rides inside the markdown card.
+def _buttons(actions: list[dict[str, Any]]) -> list[ActionRow]:
+    """Build QQ-compatible button rows without changing their callback deadline.
 
     Args:
-        entry: The character the buttons belong to.
+        actions: Callback descriptions with a label and JSON-compatible data.
 
     Returns:
-        One row with a button per operator sub-query.
+        At most five rows with five buttons each.
     """
-    return ActionRow(
-        buttons=[
-            Button(
-                id=f"ri_{operation}",
-                label=label,
-                style=Button.Style.SUCCESS,
-                action=Button.CallbackAction(
-                    data={
-                        "op": operation,
-                        "game": entry.game,
-                        "id": entry.entry_id,
-                        "ts": int(time.time()),
-                    }
-                ),
+    issued = time.time()
+    buttons = [
+        Button(
+            id=f"ri_{index}",
+            label=str(action["label"]),
+            style=Button.Style.SUCCESS,
+            action=Button.CallbackAction(data={**action["data"], "ts": issued}),
+        )
+        for index, action in enumerate(actions[:25], 1)
+    ]
+    return [ActionRow(buttons=buttons[i : i + 5]) for i in range(0, len(buttons), 5)]
+
+
+def _matches(query: str, items: list[dict[str, Any]]) -> tuple[list, list]:
+    """Separate exact matches from plausible fuzzy candidates.
+
+    Args:
+        query: User-supplied name, alias or stage code.
+        items: MCP search candidates already filtered by requested type.
+
+    Returns:
+        Exact and plausible-but-inexact candidates, respectively.
+    """
+    needle = query.casefold().strip()
+    exact, fuzzy = [], []
+    for item in items:
+        values = [
+            str(item.get(key) or "").casefold().strip()
+            for key in ("id", "name", "from_alias", "code")
+        ]
+        if needle in values:
+            exact.append(item)
+        elif any(
+            value
+            and (
+                needle in value
+                or (
+                    len(needle) >= 3
+                    and SequenceMatcher(None, needle, value).ratio() >= 0.66
+                )
             )
-            for operation, label in _OPERATOR_ACTIONS
-        ],
-        fallback_text="模组 皮肤 档案 阵营 语音",
-    )
-
-
-def _card_message(entry: GameDataEntry) -> MessageEventResult:
-    """Build the message that carries the button row under a character card.
-
-    Args:
-        entry: The character the card belongs to.
-
-    Returns:
-        A markdown message with one button per operator sub-query.
-    """
-    result = MessageEventResult().message(f"{entry.title} · 相关资料")
-    result.use_markdown(True)
-    result.chain.append(_operator_buttons(entry))
-    return result
+            for value in values[1:]
+        ):
+            fuzzy.append(item)
+    return exact, fuzzy
 
 
 class Main(star.Star):
-    """Own the Arknights and Endfield providers for the plugin lifetime.
+    """Route game-data requests to the configured MCP server."""
 
-    A single silent handler answers a bare character name that follows the
-    wake word. Anything that does not resolve to exactly one character
-    produces no output at all.
-    """
-
-    def __init__(self, context: star.Context, config: dict | None = None) -> None:
-        """Build the shared network client and both providers.
+    def __init__(self, context: star.Context, config: dict | None = None):
+        """Initialize the gateway and per-session interaction state.
 
         Args:
-            context: The AstrBot plugin context.
-            config: Plugin configuration parsed from ``_conf_schema.json``.
+            context: AstrBot plugin context.
+            config: Plugin configuration, if available.
         """
         super().__init__(context, config)
         config = config or {}
-        self._render_timeout = _number(config, "render_timeout", 30.0, float)
-        data_dir: Path | None = None
         try:
-            data_dir = star.StarTools.get_data_dir(
-                "astrbot_plugin_rhodes_island_archive"
-            )
-        except (RuntimeError, ValueError, OSError) as exc:
-            self.logger.warning("Disk cache unavailable, keeping memory only: %s", exc)
-        cache_dir = data_dir / "cache" if data_dir is not None else None
-        self.net = NetClient(
-            ("torappu.prts.wiki", "data.akedata.wiki"),
-            timeout=_number(config, "timeout", 20.0, float),
-            cache_ttl=_number(config, "cache_ttl", 600, float),
-            max_bytes=int(_number(config, "max_download_mb", 32, float) * 1024 * 1024),
-            user_agent=str(config.get("user_agent") or DEFAULT_USER_AGENT),
-            cache_dir=cache_dir,
-            logger=self.logger,
+            timeout = float(config.get("timeout", 30.0))
+            if not math.isfinite(timeout) or timeout <= 0:
+                timeout = 30.0
+        except (TypeError, ValueError):
+            timeout = 30.0
+        self._mcp = MCPGateway(
+            str(config.get("mcp_url") or _DEFAULT_MCP_URL), timeout=timeout
         )
-        self.arknights = ArknightsProvider(self.net)
-        self.endfield = EndfieldProvider(self.net)
-        self._image_dir = cache_dir / "images" if cache_dir is not None else None
-        # QQ turns inline keyboard clicks into their label text, so remember
-        # which operator each session last looked up, and when.
-        self._last_operator: dict[str, tuple[str, str, float]] = {}
-        # Sessions that asked for a recruitment screenshot, with the
-        # monotonic deadline of their waiting window.
-        self._pending_recruit: dict[str, float] = {}
-        self._renderer: LocalRenderer | None = None
-        self._renderer_ready = False
-        if data_dir is not None:
-            self._renderer = LocalRenderer(
-                ASSETS_DIR,
-                cache_dir / "render",
-                timeout=self._render_timeout,
-                browsers=browsers_dir(data_dir),
-                logger=self.logger,
-            )
+        self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        self._dimensions: dict[str, tuple[int, int]] = {}
+        self._vocabulary: list[str] | None = None
+        self._last_operator: dict[str, tuple[dict[str, Any], float]] = {}
+        self._selections: dict[str, tuple[list[dict[str, Any]], float]] = {}
+        self._recent_images: dict[tuple[str, str], Image] = {}
+        self._pending_recruit: dict[tuple[str, str], float] = {}
 
-    async def _local_renderer(self) -> LocalRenderer | None:
-        """Start the local browser once, if this installation supports it.
-
-        Returns:
-            The running renderer, or ``None`` when Playwright or its Chromium
-            build is unavailable and the remote service has to be used.
-        """
-        if self._renderer is None or self._renderer_ready:
-            return self._renderer
-        self._renderer_ready = True
+    async def terminate(self) -> None:
+        """Close both MCP and image-metadata connections on plugin unload."""
         try:
-            await self._renderer.start()
-        except Exception as exc:  # noqa: BLE001 - any failure means "fallback"
-            self.logger.warning(
-                "local renderer unavailable, falling back to the AstrBot service: "
-                "%s: %s",
-                type(exc).__name__,
-                exc,
-            )
-            self._renderer = None
-        return self._renderer
+            await self._mcp.close()
+        finally:
+            await self._http.aclose()
 
-    async def _remote_render(self, html: str, entry: GameDataEntry) -> bytes:
-        """Render through the AstrBot text-to-image service.
-
-        Args:
-            html: Complete HTML document.
-            entry: The character being rendered, used for logging.
-
-        Returns:
-            The rendered PNG bytes.
-
-        Raises:
-            UpstreamError: If the service never returns a usable PNG.
-        """
-        started = time.monotonic()
-        # The render service occasionally answers with a gateway error page or
-        # times out; one retry covers those, anything else is reported.
-        for attempt in (1, 2):
-            try:
-                path = await self.context.html_renderer.render_custom_template(
-                    html,
-                    {},
-                    return_url=False,
-                    options={"full_page": True, "type": "png"},
-                )
-                body = Path(path).read_bytes()
-            except Exception as exc:
-                # The render service fails in opaque ways (timeout, 502, reset),
-                # so the payload size is logged with the error.
-                self.logger.warning(
-                    "card %s/%s: render attempt %d failed after %.2fs, "
-                    "html %d bytes: %s: %s",
-                    entry.game,
-                    entry.entry_id,
-                    attempt,
-                    time.monotonic() - started,
-                    len(html),
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
-                )
-                if attempt == 2:
-                    raise
-                continue
-            if _valid_png(body):
-                return body
-            self.logger.warning(
-                "card %s/%s: render attempt %d returned %d bytes that are not "
-                "a PNG: %r",
-                entry.game,
-                entry.entry_id,
-                attempt,
-                len(body),
-                body[:120],
-            )
-        raise UpstreamError("Render service returned no usable PNG")
-
-    async def _render(
+    async def _message(
         self,
-        html: str,
-        entry: GameDataEntry,
+        event: AstrMessageEvent,
+        text: str,
+        url: str = "",
+        actions: list[dict[str, Any]] | None = None,
+    ) -> MessageEventResult:
+        """Compose one reply, keeping QQ Markdown images and buttons together.
+
+        Args:
+            event: Incoming message or button event.
+            text: Short caption or error message.
+            url: Public image URL returned by the MCP service.
+            actions: Optional button descriptions.
+
+        Returns:
+            A platform-compatible message chain.
+
+        Raises:
+            ValueError: If an image URL or its dimensions are invalid.
+            httpx.HTTPError: If image metadata cannot be fetched.
+        """
+        result = MessageEventResult()
+        if url:
+            parsed = urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError("Invalid MCP image URL")
+            if event.get_platform_name().startswith("qq_official"):
+                if url not in self._dimensions:
+                    parser = ImageFile.Parser()
+                    received = 0
+                    async with self._http.stream(
+                        "GET", url, headers={"Range": "bytes=0-65535"}
+                    ) as response:
+                        response.raise_for_status()
+                        async for chunk in response.aiter_bytes():
+                            received += len(chunk)
+                            parser.feed(chunk)
+                            if parser.image is not None:
+                                width, height = parser.image.size
+                                if not (0 < width <= 65535 and 0 < height <= 65535):
+                                    raise ValueError("Invalid MCP image dimensions")
+                                self._dimensions[url] = (width, height)
+                                break
+                            if received > 2 * 1024 * 1024:
+                                break
+                    if url not in self._dimensions:
+                        raise ValueError("MCP image has no readable dimensions")
+                width, height = self._dimensions[url]
+                safe_url = quote(url, safe=":/%?=&+;,@!$'*-._~%#")
+                caption = text.replace("[", "（").replace("]", "）").replace("\n", " ")
+                result.message(
+                    f"![{caption or '资料卡'} #{width}px #{height}px]({safe_url})"
+                )
+                if text:
+                    result.message(f"\n{text}")
+                result.use_markdown(True)
+            else:
+                if text:
+                    result.message(text)
+                result.url_image(url)
+        else:
+            result.message(text)
+        result.chain.extend(_buttons(actions or []))
+        return result
+
+    async def _selection_card(
+        self,
+        event: AstrMessageEvent,
+        candidates: list[dict[str, Any]],
+        operation: str,
+        response: dict[str, Any] | None = None,
+    ) -> MessageEventResult:
+        """Display MCP's selection image with buttons tied to its item order.
+
+        Args:
+            event: Incoming message event.
+            candidates: Plausible MCP results, in the desired display order.
+            operation: Requested operation, or ``auto`` for type-based routing.
+            response: Optional search-card response that was already fetched.
+
+        Returns:
+            One image and its numbered selection buttons.
+        """
+        by_id: dict[str, dict[str, Any]] = {}
+        for item in candidates:
+            item_id = str(item.get("id") or "")
+            if item_id and item_id not in by_id:
+                by_id[item_id] = item
+            if len(by_id) == 20:
+                break
+        if not by_id:
+            return await self._message(event, "没有找到匹配的结果。")
+        if response is None:
+            response = await self._mcp.call("build_search_card", {"ids": list(by_id)})
+        data = response.get("data") or {}
+        returned = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(returned, list):
+            raise MCPError("MCP 搜索卡缺少候选列表")
+        ordered = []
+        for value in returned:
+            if isinstance(value, dict) and str(value.get("id") or "") in by_id:
+                ordered.append({**by_id[str(value["id"])], **value})
+        if not ordered:
+            raise MCPError("MCP 搜索卡未返回可用候选")
+        self._selections[event.unified_msg_origin] = (
+            [
+                {"action": "select", "operation": operation, "item": item}
+                for item in ordered
+            ],
+            time.time(),
+        )
+        actions = [
+            {
+                "label": str(index),
+                "data": {"action": "select", "operation": operation, "item": item},
+            }
+            for index, item in enumerate(ordered, 1)
+        ]
+        return await self._message(
+            event,
+            "请选择编号",
+            str(response.get("card_image_url") or ""),
+            actions,
+        )
+
+    async def _lookup(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        operation: str,
         *,
-        size: tuple[int, int] | None = None,
-    ) -> bytes:
-        """Render the card, preferring the local browser.
+        silent: bool = False,
+    ) -> MessageEventResult | None:
+        """Resolve names without treating fuzzy search hits as exact matches.
 
         Args:
-            html: Complete HTML document.
-            entry: The character being rendered, used for logging.
-            size: Optional viewport size for pages that are not 1400x900.
+            event: Incoming request.
+            query: Name, alias, code or upstream ID.
+            operation: Requested detail operation, ``search`` or ``auto``.
+            silent: Suppress the no-match message for bare character names.
 
         Returns:
-            The rendered PNG bytes.
+            A result, a selection card, or None for an unmatched bare query.
         """
-        renderer = await self._local_renderer()
-        if renderer is not None:
-            started = time.monotonic()
-            try:
-                body = await renderer.render(
-                    html, **(dict(zip(("width", "height"), size)) if size else {})
-                )
-                if _valid_png(body):
-                    self.logger.debug(
-                        "card %s/%s: local render in %.2fs",
-                        entry.game,
-                        entry.entry_id,
-                        time.monotonic() - started,
-                    )
-                    return body
-                self.logger.warning(
-                    "card %s/%s: local render returned %d bytes that are not a PNG",
-                    entry.game,
-                    entry.entry_id,
-                    len(body),
-                )
-            except Exception as exc:  # noqa: BLE001 - fall back to the service
-                self.logger.warning(
-                    "card %s/%s: local render failed after %.2fs: %s: %s",
-                    entry.game,
-                    entry.entry_id,
-                    time.monotonic() - started,
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
-                )
-        return await self._remote_render(html, entry)
+        query = query.strip()
+        if not query:
+            return await self._message(event, "请提供名称或 ID。")
+        looks_like_id = bool(re.search(r"[_:@#]", query) or query.isdecimal())
+        if looks_like_id:
+            # Search uses fuzzy matching even for IDs; this tool resolves exact IDs.
+            resolved = await self._mcp.call("build_search_card", {"ids": [query]})
+            data = resolved.get("data") or {}
+            values = data.get("items") if isinstance(data, dict) else None
+            items = [
+                item
+                for item in values or []
+                if isinstance(item, dict) and item.get("id") == query
+            ]
+        else:
+            response = await self._mcp.call("search", {"query": query})
+            data = response.get("data") or {}
+            values = data.get("items") if isinstance(data, dict) else None
+            items = [item for item in values or [] if isinstance(item, dict)]
+        items = [
+            item
+            for item in items
+            if COMMANDS.accepts(operation, str(item.get("type") or ""))
+        ]
+        exact, fuzzy = _matches(query, items)
+        if operation == "search":
+            candidates = [item for item in items if item in exact or item in fuzzy]
+        else:
+            candidates = exact or fuzzy
+        if not candidates:
+            return (
+                None
+                if silent
+                else await self._message(event, f"没有找到「{query}」的相关结果。")
+            )
+        if operation == "search":
+            return await self._selection_card(event, candidates, "auto")
+        if len(exact) == 1:
+            return await self._execute(event, operation, exact[0])
+        return await self._selection_card(event, candidates, operation)
 
-    async def _card_image(
-        self, provider: GameDataProvider, entry: GameDataEntry
-    ) -> str:
-        """Render the character card and return the PNG path to send.
-
-        The rendered PNG is cached per character so a repeated lookup skips
-        both the table reads and the rendering itself.
+    async def _execute(
+        self, event: AstrMessageEvent, operation: str, item: dict[str, Any]
+    ) -> MessageEventResult:
+        """Call the selected MCP detail tool and compose its response.
 
         Args:
-            provider: Provider that owns the character.
-            entry: The matched character.
+            event: Incoming message or button event.
+            operation: Requested detail operation or ``auto``.
+            item: Exact MCP search result or previously returned item.
 
         Returns:
-            Path of the rendered PNG.
+            The service's card, its normal empty-state message, or structured data.
 
         Raises:
-            UpstreamError: If no backend produced a usable PNG.
-            OSError: If the rendered file cannot be read or written.
+            MCPError: If the selected item cannot be mapped to a service tool.
         """
-        target = None
-        if self._image_dir is not None:
-            # The version prefix invalidates cards rendered by older layouts.
-            target = self._image_dir / f"card_v16_{entry.game}_{entry.entry_id}.png"
-            if target.is_file():
-                cached = target.read_bytes()
-                if _valid_png(cached):
-                    self.logger.info(
-                        "card %s/%s: cache hit %s (%d bytes)",
-                        entry.game,
-                        entry.entry_id,
-                        target.name,
-                        len(cached),
-                    )
-                    return str(target)
-                self.logger.warning(
-                    "card %s/%s: dropping invalid cache %s (%d bytes: %r)",
-                    entry.game,
-                    entry.entry_id,
-                    target.name,
-                    len(cached),
-                    cached[:80],
-                )
-                target.unlink(missing_ok=True)
-
-        started = time.monotonic()
-        self.logger.info("card %s/%s: collecting data", entry.game, entry.entry_id)
-        card = await provider.card(entry)
-        collected = time.monotonic()
-        self.logger.debug(
-            "card %s/%s: art inlined=%s skills=%d devices=%d",
-            entry.game,
-            entry.entry_id,
-            bool(card.get("art")),
-            len(card.get("skills") or []),
-            len(card.get("devices") or []),
-        )
-
-        renderer = await self._local_renderer()
-        html = render_card(card, font=renderer.font_family if renderer else None)
-        rendered_started = time.monotonic()
-        body = await self._render(html, entry)
-        rendered = time.monotonic()
-        self.logger.info(
-            "card %s/%s: data %.2fs, html %.0f KB, render %.2fs, png %.0f KB",
-            entry.game,
-            entry.entry_id,
-            collected - started,
-            len(html) / 1024,
-            rendered - rendered_started,
-            len(body) / 1024,
-        )
-        if target is None:
-            # Without a data directory the image still has to exist on disk for
-            # the platform layer to upload it, so it goes to the temp directory.
-            self.logger.debug(
-                "card %s/%s: no cache dir, returning temp file",
-                entry.game,
-                entry.entry_id,
+        kind = str(item.get("type") or "")
+        if operation == "auto":
+            operation = COMMANDS.operation_for(kind)
+        if not COMMANDS.has(operation):
+            raise MCPError("该搜索结果没有对应的详情接口")
+        item_id = str(item.get("id") or "")
+        title = str(item.get("name") or item.get("名称") or item_id)
+        skin_id = item_id if operation == "skins" and kind == "皮肤" else ""
+        if operation == "skins" and skin_id:
+            item_id = str(item.get("operator_id") or "")
+        if operation == "token" and kind == "干员":
+            basic = await self._mcp.call(
+                "get_operator_basic_data", {"operator_id": item_id}
             )
-            target = Path(tempfile.gettempdir()) / f"card_{entry.entry_id}.png"
-        return str(_store_image(body, target))
-
-    async def _token_image(
-        self, provider: GameDataProvider, entry: GameDataEntry
-    ) -> str | None:
-        """Render the separate device page of one character.
-
-        Args:
-            provider: Provider that owns the character.
-            entry: The matched character.
-
-        Returns:
-            Path of the rendered PNG, or ``None`` when the character deploys
-            no device or the page cannot be produced.
-        """
-        target = None
-        if self._image_dir is not None:
-            target = self._image_dir / f"token_v2_{entry.game}_{entry.entry_id}.png"
-            if target.is_file():
-                cached = target.read_bytes()
-                if _valid_png(cached):
-                    self.logger.info(
-                        "token page %s/%s: cache hit %s (%d bytes)",
-                        entry.game,
-                        entry.entry_id,
-                        target.name,
-                        len(cached),
-                    )
-                    return str(target)
-                target.unlink(missing_ok=True)
-
-        started = time.monotonic()
-        page = await provider.token_card(entry)
-        if not page:
-            return None
-        renderer = await self._local_renderer()
-        html = render_token_card(page, font=renderer.font_family if renderer else None)
-        body = await self._render(html, entry, size=(1280, 720))
-        self.logger.info(
-            "token page %s/%s: %d device(s), html %.0f KB, png %.0f KB in %.2fs",
-            entry.game,
-            entry.entry_id,
-            len(page.get("tokens") or []),
-            len(html) / 1024,
-            len(body) / 1024,
-            time.monotonic() - started,
+            data = basic.get("data") or {}
+            tokens = data.get("召唤物") if isinstance(data, dict) else None
+            if not isinstance(tokens, dict):
+                return await self._message(event, f"{title} 没有召唤物资料。")
+            token_items = [
+                {"id": token.get("id"), "name": token.get("名称"), "type": "召唤物"}
+                for token in tokens.get("列表") or []
+                if isinstance(token, dict) and token.get("id")
+            ]
+            if len(token_items) == 1:
+                return await self._execute(event, "token", token_items[0])
+            if token_items:
+                return await self._selection_card(event, token_items, "token")
+            return await self._message(event, f"{title} 没有召唤物资料。")
+        if not item_id:
+            raise MCPError("搜索结果缺少详情所需的 ID")
+        tool, argument = COMMANDS.tool(operation)
+        response = await self._mcp.call(tool, {argument: item_id})
+        data = response.get("data") or {}
+        url = str(response.get("card_image_url") or "")
+        actions: list[dict[str, Any]] = []
+        if operation == "operator" and isinstance(data, dict):
+            names = data.get("名称")
+            if isinstance(names, dict):
+                title = str(names.get("中文名") or title)
+            operator = {"id": item_id, "name": title, "type": "干员"}
+            self._last_operator[event.unified_msg_origin] = (operator, time.time())
+            actions = [
+                {
+                    "label": label,
+                    "data": {"action": "select", "operation": op, "item": operator},
+                }
+                for op, label in (
+                    ("modules", "模组"),
+                    ("skins", "皮肤"),
+                    ("operator_material", "材料"),
+                )
+            ]
+            tokens = data.get("召唤物")
+            if isinstance(tokens, dict) and tokens.get("列表"):
+                actions.append(
+                    {
+                        "label": "召唤物",
+                        "data": {
+                            "action": "select",
+                            "operation": "token",
+                            "item": operator,
+                        },
+                    }
+                )
+        elif operation == "skins" and isinstance(data, dict):
+            skins = [skin for skin in data.get("skins") or [] if isinstance(skin, dict)]
+            if skin_id:
+                chosen = next(
+                    (skin for skin in skins if skin.get("id") == skin_id), None
+                )
+                if chosen is None:
+                    raise MCPError("MCP 未返回所选皮肤")
+                title = str(chosen.get("名称") or title)
+                url = str(chosen.get("card_url") or chosen.get("立绘URL") or "")
+            else:
+                selections = []
+                for skin in skins[:25]:
+                    skin_url = str(skin.get("card_url") or skin.get("立绘URL") or "")
+                    if skin_url:
+                        selections.append(
+                            {
+                                "action": "image",
+                                "url": skin_url,
+                                "title": str(skin.get("名称") or "皮肤"),
+                            }
+                        )
+                self._selections[event.unified_msg_origin] = (selections, time.time())
+                actions = [
+                    {"label": str(index), "data": selection}
+                    for index, selection in enumerate(selections, 1)
+                ]
+                if len(skins) > 25:
+                    title += "（前 25 套，可按皮肤名称查询）"
+        if url:
+            return await self._message(
+                event, f"{title} · {COMMANDS.label(operation)}", url, actions
+            )
+        message = str(response.get("message") or "")
+        if message:
+            return await self._message(event, message)
+        if data:
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+            if len(text) > 3000:
+                text = text[:3000] + "\n……内容较长，已截取前 3000 字符。"
+            return await self._message(event, text)
+        return await self._message(
+            event, f"{title} 暂无{COMMANDS.label(operation)}资料。"
         )
-        if target is None:
-            target = Path(tempfile.gettempdir()) / f"token_{entry.entry_id}.png"
-        return str(_store_image(body, target))
 
-    async def _first_image(self, event: AstrMessageEvent) -> str | None:
-        """Return the local path of the first image in one message.
-
-        Args:
-            event: The message event to inspect.
+    async def _vocabulary_from_mcp(self) -> list[str]:
+        """Read accepted recruitment labels from the live MCP tool schema.
 
         Returns:
-            Absolute file path, or ``None`` when the message carries no image.
-        """
-        for component in event.get_messages():
-            if isinstance(component, Image):
-                try:
-                    return await component.convert_to_file_path()
-                except Exception as exc:  # noqa: BLE001 - download may fail
-                    self.logger.warning("image download failed: %s", exc)
-                    return None
-        return None
-
-    async def _recruit_image(self, page: dict[str, Any]) -> str:
-        """Render the recruitment result page, reusing cached images.
-
-        Args:
-            page: Result mapping from ``ArknightsProvider.recruit``.
-
-        Returns:
-            Path of the rendered PNG.
-        """
-        key = hashlib.sha1(
-            "|".join(sorted(page.get("tags") or [])).encode("utf-8")
-        ).hexdigest()[:16]
-        target = None
-        if self._image_dir is not None:
-            target = self._image_dir / f"recruit_{key}.png"
-            if target.is_file():
-                body = target.read_bytes()
-                if _valid_png(body):
-                    self.logger.info(
-                        "recruit %s: cache hit %s (%d bytes)",
-                        key,
-                        target.name,
-                        len(body),
-                    )
-                    return str(target)
-                target.unlink(missing_ok=True)
-
-        renderer = await self._local_renderer()
-        html = render_recruit(page, font=renderer.font_family if renderer else None)
-        started = time.monotonic()
-        body = await self._render(
-            html, GameDataEntry("arknights", "recruit", key, key), size=(1280, 720)
-        )
-        self.logger.info(
-            "recruit %s: %d group(s), html %.0f KB, png %.0f KB in %.2fs",
-            key,
-            len(page.get("groups") or []),
-            len(html) / 1024,
-            len(body) / 1024,
-            time.monotonic() - started,
-        )
-        if target is None:
-            path = Path(tempfile.gettempdir()) / f"recruit_{key}.png"
-            path.write_bytes(body)
-            return str(path)
-        return str(_store_image(body, target))
-
-    async def _tags_from_image(self, image_path: str) -> list[str]:
-        """Read recruitment tags out of a screenshot.
-
-        Args:
-            image_path: Local path of the screenshot.
-
-        Returns:
-            Recognised tags, empty when the image holds none.
+            The server's tag enum, longest first.
 
         Raises:
-            OCRError: If the local OCR backend is unavailable.
+            MCPError: If the service does not expose a usable tag enum.
         """
-        text = await recognize(image_path)
-        tags = match_recruit_tags(text, await self.arknights.recruit_vocabulary())
-        self.logger.info("recruit OCR text: %r -> %s", text, tags)
-        return tags
+        if self._vocabulary is None:
+            schema = await self._mcp.input_schema("recruit_with_tag")
+            tags = (
+                schema.get("properties", {})
+                .get("tags", {})
+                .get("items", {})
+                .get("enum")
+            )
+            if not isinstance(tags, list) or not all(
+                isinstance(tag, str) for tag in tags
+            ):
+                raise MCPError("MCP 公招接口没有提供可用的标签列表")
+            self._vocabulary = sorted(tags, key=len, reverse=True)
+        return self._vocabulary
 
-    async def _recruit_answer(self, event: AstrMessageEvent, tags: list[str]):
-        """Render the page for one tag set.
+    async def _recruit(
+        self, event: AstrMessageEvent, tags: list[str]
+    ) -> MessageEventResult:
+        """Send the complete tag list to MCP and report ignored labels.
 
         Args:
-            event: The message event being answered.
-            tags: Recruitment tags to solve.
+            event: Incoming message event.
+            tags: One to five distinct labels supplied by the user or OCR.
 
-        Yields:
-            The rendered page, or a short hint when nothing is available.
+        Returns:
+            The unmodified MCP result image and any ignored-tag notice.
         """
-        try:
-            page = await self.arknights.recruit(tags)
-        except Exception as exc:  # noqa: BLE001 - never crash the event
-            self.logger.warning(
-                "recruit %s failed: %s: %s", tags, type(exc).__name__, exc
-            )
-            return
-        if not page.get("candidates"):
-            yield event.plain_result("博士，无法查询到标签所拥有的稀有干员")
-            return
-        if not page.get("groups"):
-            yield event.plain_result("博士，没有找到可以锁定稀有干员的组合")
-            return
-        try:
-            image = await self._recruit_image(page)
-        except Exception as exc:  # noqa: BLE001 - rendering must not crash
-            self.logger.warning(
-                "recruit render failed: %s: %s", type(exc).__name__, exc
-            )
-            return
-        yield event.image_result(image)
+        vocabulary = await self._vocabulary_from_mcp()
+        invalid = [tag for tag in tags if tag not in vocabulary]
+        if invalid or not 1 <= len(tags) <= 5:
+            return await self._message(event, "请提供 1 至 5 个有效的公招标签。")
+        response = await self._mcp.call("recruit_with_tag", {"tags": tags})
+        data = response.get("data") or {}
+        accepted = data.get("tags") if isinstance(data, dict) else None
+        ignored = []
+        if isinstance(accepted, list):
+            accepted_set = set(accepted)
+            for tag in tags:
+                normalized = (
+                    tag[:-2]
+                    if tag.endswith("干员") and tag[:-2] in _PROFESSIONS
+                    else tag
+                )
+                if normalized not in accepted_set:
+                    ignored.append(tag)
+        notice = "公开招募"
+        if ignored:
+            notice += "\nMCP 未识别的标签：" + "、".join(ignored)
+        url = str(response.get("card_image_url") or "")
+        if url:
+            return await self._message(event, notice, url)
+        return await self._message(event, str(response.get("message") or notice))
 
-    def _wait_for_image(self, event: AstrMessageEvent) -> None:
-        """Remember that this session owes the plugin a screenshot.
+    async def _recruit_image(
+        self, event: AstrMessageEvent, image: Image
+    ) -> MessageEventResult:
+        """Recognize five screenshot labels before calling the MCP planner.
 
         Args:
-            event: The message event that started the wait.
+            event: Event that supplied the screenshot.
+            image: Image component from the screenshot.
+
+        Returns:
+            The recruitment result or a prompt to provide another image.
         """
-        self._pending_recruit[event.unified_msg_origin] = (
-            time.monotonic() + _RECRUIT_WAIT
-        )
-
-    @filter.regex(r"^(?:公开招募|公招|高资|高姿)")
-    async def on_recruit(self, event: AstrMessageEvent):
-        """Answer a recruitment request with the tag combination page.
-
-        Args:
-            event: The message event carrying the tags.
-
-        Yields:
-            The rendered page, or a short hint when no tag was recognised.
-        """
-        if not event.is_at_or_wake_command:
-            return
-        tags = _recruit_tags(event.get_message_str())
-        if tags:
-            async for result in self._recruit_answer(event, tags):
-                yield result
-            return
-
-        image_path = await self._first_image(event)
-        if image_path is None:
-            self._wait_for_image(event)
-            yield event.plain_result(
-                f"请发送公招界面截图，{_RECRUIT_WAIT:.0f} 秒内有效；"
-                "也可以直接写标签，例如：公招 资深 输出"
-            )
-            return
+        key = (event.unified_msg_origin, str(event.get_sender_id()))
         try:
-            tags = await self._tags_from_image(image_path)
+            path = await image.convert_to_file_path()
+        except Exception as exc:  # noqa: BLE001 - image adapters raise varied errors
+            self.logger.warning("Recruit screenshot could not be read: %s", exc)
+            self._pending_recruit[key] = time.monotonic() + _RECRUIT_WAIT
+            return await self._message(event, "截图读取失败，请在 30 秒内再发一张。")
+        try:
+            text = re.sub(r"\s+", "", await recognize(path))
+            vocabulary = await self._vocabulary_from_mcp()
+            visible_tags = {tag: tag for tag in vocabulary}
+            visible_tags.update(
+                {
+                    profession: f"{profession}干员"
+                    for profession in _PROFESSIONS
+                    if f"{profession}干员" in vocabulary
+                }
+            )
+            visible_order = sorted(visible_tags, key=len, reverse=True)
+            found: list[str] = []
+            index = 0
+            while index < len(text):
+                for visible in visible_order:
+                    if text.startswith(visible, index):
+                        tag = visible_tags[visible]
+                        if tag not in found:
+                            found.append(tag)
+                        index += len(visible)
+                        break
+                else:
+                    index += 1
+            if len(found) != 5:
+                self._pending_recruit[key] = time.monotonic() + _RECRUIT_WAIT
+                return await self._message(
+                    event,
+                    f"识别到 {len(found)} 个标签，请发送包含完整 5 个标签的截图。",
+                )
+            self._pending_recruit.pop(key, None)
+            return await self._recruit(event, found)
         except OCRError as exc:
-            self.logger.warning("recruit OCR failed: %s", exc)
             if "未安装" in str(exc):
-                yield event.plain_result(str(exc))
-                return
-            self._wait_for_image(event)
-            yield event.plain_result(
-                "博士，这张图没读出文字，请再发一张；也可以直接写标签"
+                self._pending_recruit.pop(key, None)
+                return await self._message(event, str(exc))
+            self._pending_recruit[key] = time.monotonic() + _RECRUIT_WAIT
+            return await self._message(
+                event, "截图文字识别失败，请在 30 秒内再发一张。"
             )
-            return
-        if not tags:
-            self._wait_for_image(event)
-            yield event.plain_result("博士，没有在图内找到标签信息，请再发一张截图")
-            return
-        async for result in self._recruit_answer(event, tags):
-            yield result
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.custom_filter(_ImageFilter)
+    @filter.event_message_type(
+        filter.EventMessageType.ALL,
+        desc="公招等待期间收到的截图：识别五个标签并出公开招募卡片",
+    )
     async def on_recruit_image(self, event: AstrMessageEvent):
-        """Read a follow-up screenshot while a recruitment wait is open.
+        """Remember the sender's latest image and process pending screenshots.
 
         Args:
-            event: Any incoming message; only images are considered.
+            event: Any incoming message event.
 
         Yields:
-            The rendered page once the screenshot yields tags.
+            A recruitment reply when an image completes a pending request.
         """
-        origin = event.unified_msg_origin
-        deadline = self._pending_recruit.get(origin)
+        images = [
+            component
+            for component in event.get_messages()
+            if isinstance(component, Image)
+        ]
+        if not images:
+            return
+        key = (event.unified_msg_origin, str(event.get_sender_id()))
+        self._recent_images[key] = images[-1]
+        deadline = self._pending_recruit.get(key)
         if deadline is None:
             return
-        if time.monotonic() > deadline:
-            self._pending_recruit.pop(origin, None)
+        if time.monotonic() >= deadline:
+            self._pending_recruit.pop(key, None)
             return
-        image_path = await self._first_image(event)
-        if image_path is None:
+        if event.is_at_or_wake_command and _RECRUIT_KEYWORD.match(
+            event.get_message_str()
+        ):
             return
         try:
-            tags = await self._tags_from_image(image_path)
-        except OCRError as exc:
-            self.logger.warning("recruit OCR failed: %s", exc)
-            if "未安装" in str(exc):
-                self._pending_recruit.pop(origin, None)
-                yield event.plain_result(str(exc))
-                return
-            self._wait_for_image(event)
-            yield event.plain_result("博士，这张图没读出文字，请再发一张")
-            return
-        if not tags:
-            # Keep the window open so the user can send another screenshot.
-            self._wait_for_image(event)
-            yield event.plain_result("博士，没有在图内找到标签信息，请再发一张截图")
-            return
-        self._pending_recruit.pop(origin, None)
-        async for result in self._recruit_answer(event, tags):
-            yield result
+            yield await self._recruit_image(event, images[-1])
+        except Exception as exc:  # noqa: BLE001 - isolate upstream event failures
+            self.logger.warning("Recruit screenshot failed: %s", exc, exc_info=True)
+            yield event.plain_result("公招查询暂时失败，请稍后重试。")
 
-    @filter.regex(_OPERATOR_MATERIAL_WORD)
-    async def on_operator_material(self, event: AstrMessageEvent):
-        """Answer 干员材料 with the materials one operator needs.
+    @filter.custom_filter(_QueryFilter)
+    @filter.regex(
+        r"^[^\n]{1,128}$",
+        desc=(
+            "查询明日方舟数据：干员、材料、模组、皮肤、召唤物、关卡、敌人、"
+            "公开招募、肉鸽、搜索、术语"
+        ),
+    )
+    async def on_query(self, event: AstrMessageEvent):
+        """Route a wake-prefixed query or an active numbered selection.
 
         Args:
-            event: The message event carrying the operator name.
+            event: Incoming message event.
 
         Yields:
-            The rendered material page, or a short hint.
+            An MCP-backed result when the text matches a supported request.
         """
-        query = _OPERATOR_MATERIAL_WORD.sub(
-            "", event.get_message_str(), count=1
-        ).strip()
-        try:
-            if query:
-                entry = await self.arknights.match(query)
-                if entry is None:
-                    yield event.plain_result(f"没有找到干员「{query}」")
-                    return
-            else:
-                key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
-                remembered = self._remembered(key)
-                if remembered is None:
-                    yield event.plain_result(
-                        "请在「干员材料」后面跟上干员名，例如：干员材料 迷迭香"
-                    )
-                    return
-                entry = await self.arknights.get_detail(remembered[1])
-            panel = await self.arknights.operator_material_panel(entry)
-        except Exception as exc:  # noqa: BLE001 - never crash the event
-            self.logger.warning("operator material %s failed: %s", query, exc)
-            return
-        if not panel:
-            yield event.plain_result(f"{entry.title} 没有养成材料数据")
-            return
-        panel["operation"] = "material"
-        try:
-            image = await self._panel_image(self.arknights, entry, panel)
-        except Exception as exc:  # noqa: BLE001 - rendering must not crash
-            self.logger.warning("material page failed: %s", exc)
-            return
-        yield event.image_result(image)
-
-    @filter.regex(_MATERIAL_SUFFIX)
-    async def on_material_suffix(self, event: AstrMessageEvent):
-        """Answer ``<干员名>材料`` with that operator's material list.
-
-        Args:
-            event: The message event carrying the operator name and suffix.
-
-        Yields:
-            The rendered material page, or a hint when the name is unknown.
-        """
-        match = _MATERIAL_SUFFIX.match(event.get_message_str().strip())
-        if match is None:
-            return
-        name = match.group(1).strip()
-        try:
-            entry = await self.arknights.match(name)
-            if entry is None:
-                panel = await self.arknights.material_panel(name)
-                if panel is None:
-                    yield event.plain_result(f"没有找到干员「{name}」")
-                    return
-                item = GameDataEntry(
-                    game="arknights",
-                    category="material",
-                    entry_id=str(panel.get("entry_id") or name),
-                    title=str(panel.get("title") or name),
-                )
-                panel["operation"] = "material"
-                image = await self._panel_image(self.arknights, item, panel)
-                yield event.image_result(image)
-                return
-            panel = await self.arknights.operator_material_panel(entry)
-        except Exception as exc:  # noqa: BLE001 - never crash the event
-            self.logger.warning("material suffix %r failed: %s", name, exc)
-            return
-        if not panel:
-            yield event.plain_result(f"{entry.title} 没有养成材料数据")
-            return
-        panel["operation"] = "material"
-        try:
-            image = await self._panel_image(self.arknights, entry, panel)
-        except Exception as exc:  # noqa: BLE001 - rendering must not crash
-            self.logger.warning("material page failed: %s", exc)
-            return
-        yield event.image_result(image)
-
-    async def _skill_answer(self, event: AstrMessageEvent, query: str):
-        """Answer a skill request for an operator name or a skill name.
-
-        Args:
-            event: The message event being answered.
-            query: Operator name, or a skill name when no operator matches.
-
-        Yields:
-            The rendered skill page, or a short hint.
-        """
-        try:
-            entry = await self.arknights.match(query)
-            if entry is not None:
-                panel = await self.arknights.operator_skill_panel(entry)
-                target = entry
-            else:
-                panel = await self.arknights.skill_panel(query)
-                target = GameDataEntry(
-                    game="arknights",
-                    category="skill",
-                    entry_id=str((panel or {}).get("entry_id") or query),
-                    title=str((panel or {}).get("title") or query),
-                )
-        except Exception as exc:  # noqa: BLE001 - never crash the event
-            self.logger.warning("skill %r failed: %s", query, exc)
-            return
-        if not panel:
-            yield event.plain_result(f"没有找到技能「{query}」")
-            return
-        panel["operation"] = "skill"
-        try:
-            image = await self._panel_image(self.arknights, target, panel)
-        except Exception as exc:  # noqa: BLE001 - rendering must not crash
-            self.logger.warning("skill page failed: %s", exc)
-            return
-        yield event.image_result(image)
-
-    @filter.regex(_OPERATOR_SKILL_WORD)
-    async def on_operator_skill(self, event: AstrMessageEvent):
-        """Answer ``干员技能 <name>`` with that operator's skills.
-
-        Args:
-            event: The message event carrying the operator name.
-
-        Yields:
-            The rendered skill page.
-        """
-        query = _OPERATOR_SKILL_WORD.sub("", event.get_message_str(), count=1).strip()
-        if not query:
-            yield event.plain_result(
-                "请在「干员技能」后面跟上干员名，例如：干员技能 迷迭香"
-            )
-            return
-        async for item in self._skill_answer(event, query):
-            yield item
-
-    @filter.regex(_SKILL_SUFFIX)
-    async def on_skill_suffix(self, event: AstrMessageEvent):
-        """Answer ``<name>技能`` for an operator or a skill.
-
-        Args:
-            event: The message event carrying the name and suffix.
-
-        Yields:
-            The rendered skill page.
-        """
-        match = _SKILL_SUFFIX.match(event.get_message_str().strip())
-        if match is None:
-            return
-        async for item in self._skill_answer(event, match.group(1).strip()):
-            yield item
-
-    @filter.regex(_SKILL_WORD)
-    async def on_skill(self, event: AstrMessageEvent):
-        """Answer ``技能 <name>`` for an operator or a skill.
-
-        Args:
-            event: The message event carrying the name.
-
-        Yields:
-            The rendered skill page.
-        """
-        query = _SKILL_WORD.sub("", event.get_message_str(), count=1).strip()
-        if not query:
-            yield event.plain_result("请在「技能」后面跟上名称，例如：技能 迷迭香")
-            return
-        async for item in self._skill_answer(event, query):
-            yield item
-
-    @filter.regex(_MATERIAL_WORD)
-    async def on_material(self, event: AstrMessageEvent):
-        """Answer 材料 with a material archive page.
-
-        Args:
-            event: The message event carrying the material name.
-
-        Yields:
-            The rendered material page, or a short hint.
-        """
-        query = _MATERIAL_WORD.sub("", event.get_message_str(), count=1).strip()
-        if not query:
-            yield event.plain_result("请在「材料」后面跟上名称，例如：材料 炽合金")
-            return
-        try:
-            panel = await self.arknights.material_panel(query)
-            if panel is None:
-                entry = await self.arknights.match(query)
-                if entry is not None:
-                    panel = await self.arknights.operator_material_panel(entry)
-                    if panel:
-                        panel["operation"] = "material"
-                        image = await self._panel_image(self.arknights, entry, panel)
-                        yield event.image_result(image)
-                        return
-                yield event.plain_result(f"没有找到材料「{query}」")
-                return
-        except Exception as exc:  # noqa: BLE001 - never crash the event
-            self.logger.warning("material %s failed: %s", query, exc)
-            return
-        entry = GameDataEntry(
-            game="arknights",
-            category="material",
-            entry_id=str(panel.get("entry_id") or query),
-            title=str(panel.get("title") or query),
-        )
-        panel["operation"] = "material"
-        try:
-            image = await self._panel_image(self.arknights, entry, panel)
-        except Exception as exc:  # noqa: BLE001 - rendering must not crash
-            self.logger.warning("material page failed: %s", exc)
-            return
-        yield event.image_result(image)
-
-    @filter.regex(r"^[^\s/]{1,32}$")
-    async def on_single_name(self, event: AstrMessageEvent):
-        """Answer a bare character name with the rendered character card.
-
-        The handler stays silent unless the wake word was used and exactly one
-        character matched, so unrelated single-word messages never get a
-        reply.
-
-        Args:
-            event: The message event that triggered the handler.
-
-        Yields:
-            The card image, or nothing when the lookup or the rendering fails.
-        """
-        if not event.is_at_or_wake_command:
-            return
         text = event.get_message_str().strip()
-        self.logger.debug("single-word lookup: %r", text)
-        if _MATERIAL_SUFFIX.match(text) or _SKILL_SUFFIX.match(text):
-            # ``迷迭香材料`` / ``迷迭香技能`` have their own handlers.
-            return
-        for provider in (self.arknights, self.endfield):
-            try:
-                entry = await provider.match(text)
-            except (UpstreamError, LookupError, ValueError) as exc:
-                self.logger.warning(
-                    "lookup %r failed in %s: %s: %s",
-                    text,
-                    provider.game,
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
+        text = re.sub(r"^干员\s+(材料|模组|皮肤|技能)", r"干员\1", text)
+        selection = _SELECTION.fullmatch(text)
+        panel_word = text in {"模组", "皮肤", "材料", "召唤物"}
+        if not event.is_at_or_wake_command and not selection:
+            saved = self._last_operator.get(event.unified_msg_origin)
+            if saved is not None and time.time() - saved[1] >= _CARD_TTL:
+                self._last_operator.pop(event.unified_msg_origin, None)
+                saved = None
+            if not panel_word or saved is None:
+                return
+        operation = "auto"
+        try:
+            if selection:
+                saved = self._selections.get(event.unified_msg_origin)
+                number = int(selection.group(1))
+                if saved is None or time.time() - saved[1] >= _CARD_TTL:
+                    self._selections.pop(event.unified_msg_origin, None)
+                    return
+                if not 1 <= number <= len(saved[0]):
+                    yield event.plain_result("请选择图片中已有的编号。")
+                    return
+                action = saved[0][number - 1]
+                if action.get("action") == "image":
+                    yield await self._message(
+                        event,
+                        str(action.get("title") or "皮肤"),
+                        str(action.get("url") or ""),
+                    )
+                else:
+                    yield await self._execute(
+                        event, str(action.get("operation") or "auto"), action["item"]
+                    )
+                return
+            if text.startswith(("技能", "干员技能")) or text.endswith("技能"):
+                return
+            if text.startswith(_DISABLED_PREFIXES):
+                return
+            query = text
+            resolved = COMMANDS.resolve(text)
+            if resolved:
+                operation, query = resolved
+            if operation == "auto":
+                suffix = SUFFIX_PATTERN.fullmatch(text)
+                if suffix:
+                    query = suffix.group(1)
+                    operation = COMMANDS.suffix_operation(suffix.group(2))
+            if text == "材料" and not event.is_at_or_wake_command:
+                operation = "operator_material"
+            if operation == "recruit":
+                key = (event.unified_msg_origin, str(event.get_sender_id()))
+                match = _RECRUIT_KEYWORD.match(text)
+                tags = (
+                    ["高级资深干员"]
+                    if match and match.group(1) in ("高资", "高姿")
+                    else []
+                )
+                for raw in _TAG_SPLIT.split(query):
+                    if not raw:
+                        continue
+                    tag = _TAG_ALIASES.get(raw, raw)
+                    if tag in _PROFESSIONS:
+                        tag += "干员"
+                    if tag not in tags:
+                        tags.append(tag)
+                if tags:
+                    self._pending_recruit.pop(key, None)
+                    yield await self._recruit(event, tags)
+                    return
+                images = [
+                    component
+                    for component in event.get_messages()
+                    if isinstance(component, Image)
+                ]
+                image = images[-1] if images else self._recent_images.get(key)
+                if image is not None:
+                    yield await self._recruit_image(event, image)
+                else:
+                    self._pending_recruit[key] = time.monotonic() + _RECRUIT_WAIT
+                    yield event.plain_result(
+                        "请发送公招截图，30 秒内有效；也可以直接输入标签。"
+                    )
+                return
+            if operation == "search_card":
+                ids = list(
+                    dict.fromkeys(value for value in _TAG_SPLIT.split(query) if value)
+                )
+                if not 1 <= len(ids) <= 20:
+                    yield event.plain_result("请提供 1 至 20 个不同的结果 ID。")
+                    return
+                result = await self._mcp.call("build_search_card", {"ids": ids})
+                data = result.get("data") or {}
+                items = data.get("items") if isinstance(data, dict) else []
+                yield await self._selection_card(event, items or [], "auto", result)
+                return
+            if operation == "glossary":
+                names = [value for value in _TAG_SPLIT.split(query) if value]
+                if not names:
+                    yield event.plain_result("请提供要查询的术语。")
+                    return
+                result = await self._mcp.call(
+                    "get_glossary",
+                    {"glossary_name": names[0] if len(names) == 1 else names},
+                )
+                yield await self._message(
+                    event,
+                    json.dumps(result, ensure_ascii=False, indent=2)
+                    if result
+                    else "MCP 未返回该术语的解释。",
                 )
                 return
-            if entry is None:
-                continue
-            self.logger.debug("matched %r -> %s/%s", text, entry.game, entry.entry_id)
-            try:
-                image = await self._card_image(provider, entry)
-            except Exception as exc:  # noqa: BLE001 - never crash the event
-                # Rendering can fail with transport errors, plugin exceptions or
-                # anything a render backend raises; the handler stays silent
-                # but the reason is always logged.
-                self.logger.warning(
-                    "card for %s/%s failed: %s: %s",
-                    entry.game,
-                    entry.entry_id,
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
-                )
+            if (
+                operation in ("modules", "skins", "operator_material", "token")
+                and not query
+            ):
+                saved = self._last_operator.get(event.unified_msg_origin)
+                if saved is None or time.time() - saved[1] >= _CARD_TTL:
+                    self._last_operator.pop(event.unified_msg_origin, None)
+                    yield event.plain_result("请在指令后提供干员名称。")
+                    return
+                yield await self._execute(event, operation, saved[0])
                 return
-            try:
-                token_image = await self._token_image(provider, entry)
-            except Exception as exc:  # noqa: BLE001 - device page is optional
-                self.logger.warning(
-                    "token page for %s/%s failed: %s: %s",
-                    entry.game,
-                    entry.entry_id,
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
-                )
-                token_image = None
-            key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
-            self._last_operator[key] = (entry.game, entry.entry_id, time.time())
-            # Pictures first: a markdown reply resets the platform send buffer and
-            # would make the following picture fail with "无效 markdown content".
-            yield event.image_result(image)
-            if token_image:
-                yield event.image_result(token_image)
-            if (event.get_platform_name() or "").startswith(_BUTTON_PLATFORMS):
-                yield _card_message(entry)
-            return
-        # No operator carries that name; a material may still match, since the
-        # wake word already keeps unrelated chatter away.
-        try:
-            panel = await self.arknights.material_panel(text)
-        except (UpstreamError, LookupError, ValueError) as exc:
-            self.logger.warning("material lookup %r failed: %s", text, exc)
-            return
-        if panel:
-            item = GameDataEntry(
-                game="arknights",
-                category="material",
-                entry_id=str(panel.get("entry_id") or text),
-                title=str(panel.get("title") or text),
-            )
-            panel["operation"] = "material"
-            try:
-                image = await self._panel_image(self.arknights, item, panel)
-            except Exception as exc:  # noqa: BLE001 - never crash the event
-                self.logger.warning("material page %r failed: %s", text, exc)
+            if operation == "auto" and not text:
                 return
-            yield event.image_result(image)
-            return
-        try:
-            skill_panel = await self.arknights.skill_panel(text)
-        except (UpstreamError, LookupError, ValueError) as exc:
-            self.logger.warning("skill lookup %r failed: %s", text, exc)
-            return
-        if skill_panel:
-            skill_panel["operation"] = "skill"
-            item = GameDataEntry(
-                game="arknights",
-                category="skill",
-                entry_id=str(skill_panel.get("entry_id") or text),
-                title=str(skill_panel.get("title") or text),
-            )
-            try:
-                image = await self._panel_image(self.arknights, item, skill_panel)
-            except Exception as exc:  # noqa: BLE001 - never crash the event
-                self.logger.warning("skill page %r failed: %s", text, exc)
-                return
-            yield event.image_result(image)
-            return
-        self.logger.debug("no character matched %r", text)
-
-    def _remembered(self, key: str) -> tuple[str, str] | None:
-        """Return the operator a session last looked up, if still fresh.
-
-        Args:
-            key: Session key the lookup was remembered under.
-
-        Returns:
-            ``(game, entry_id)`` while the card is younger than ``_CARD_TTL``;
-            an expired entry is dropped and ``None`` is returned.
-        """
-        remembered = self._last_operator.get(key)
-        if remembered is None:
-            return None
-        game, entry_id, stamped_at = remembered
-        if time.time() - stamped_at > _CARD_TTL:
-            self._last_operator.pop(key, None)
-            self.logger.debug("card context for %s expired", key)
-            return None
-        return game, entry_id
-
-    @filter.regex(_PANEL_WORD)
-    async def on_panel_word(self, event: AstrMessageEvent):
-        """Answer 模组 / 皮肤 / 档案 / 阵营 / 语音 for the last shown operator.
-
-        QQ turns inline keyboard clicks into their label text instead of a
-        callback, so the same pages are reachable by typing the word right after
-        a character card was shown.
-
-        Args:
-            event: The message event that triggered the handler.
-
-        Yields:
-            The rendered sub-page, or nothing when no operator was shown yet.
-        """
-        key = getattr(event, "unified_msg_origin", "") or event.get_session_id()
-        remembered = self._remembered(key)
-        if remembered is None:
-            return
-        game, entry_id = remembered
-        word = event.get_message_str().strip()
-        if word.startswith("干员"):
-            word = word[2:].strip()
-        operation = _PANEL_WORDS.get(word)
-        if not operation:
-            return
-        provider = self.arknights if game == "arknights" else self.endfield
-        collector = f"{operation}_panel"
-        try:
-            entry = await provider.get_detail(entry_id)
-            panel = await getattr(provider, collector)(entry)
-            if not panel:
-                yield event.plain_result(f"{entry.title} 没有{word}数据")
-                return
-            panel["operation"] = operation
-            image = await self._panel_image(provider, entry, panel)
-        except Exception as exc:  # noqa: BLE001 - never crash the event
-            self.logger.warning(
-                "panel %s/%s/%s failed: %s: %s",
-                game,
+            # Single-token bare names stay silent; anything else answers explicitly.
+            result = await self._lookup(
+                event,
+                query,
                 operation,
-                entry_id,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
+                silent=operation == "auto" and not re.search(r"\s", text),
             )
-            return
-        yield event.image_result(image)
+            if result is not None:
+                yield result
+        except MCPError as exc:
+            self.logger.warning("MCP query failed: %r", exc.__cause__ or exc)
+            if operation != "auto":
+                yield event.plain_result(str(exc))
+        except Exception as exc:  # noqa: BLE001 - isolate upstream event failures
+            self.logger.warning("Game-data query failed: %s", exc, exc_info=True)
+            yield event.plain_result("查询暂时失败，请稍后重试。")
 
-    async def _panel_image(
-        self, provider: GameDataProvider, entry: GameDataEntry, panel: dict[str, Any]
-    ) -> str:
-        """Render one operator sub-page and cache the PNG.
+    @filter.button_action(
+        desc="干员卡与选择卡上的按钮：切换模组、皮肤、材料、召唤物或候选项",
+    )
+    async def on_button(self, event: AstrMessageEvent):
+        """Reply to this plugin's non-expired card buttons.
 
         Args:
-            provider: Provider that owns the character.
-            entry: The character the page belongs to.
-            panel: Panel data returned by the provider.
-
-        Returns:
-            Path of the rendered PNG.
-
-        Raises:
-            UpstreamError: If no render backend produced a usable PNG.
-            OSError: If the rendered file cannot be read or written.
-        """
-        operation = str(panel.get("operation") or "panel")
-        target = None
-        if self._image_dir is not None:
-            target = (
-                self._image_dir
-                / f"panel_v1_{entry.game}_{operation}_{entry.entry_id}.png"
-            )
-            if target.is_file():
-                cached = target.read_bytes()
-                if _valid_png(cached):
-                    return str(target)
-                self.logger.warning("panel %s: dropping invalid cache", target.name)
-                target.unlink(missing_ok=True)
-        renderer = await self._local_renderer()
-        html = render_panel(panel, font=renderer.font_family if renderer else None)
-        body = await self._render(html, entry, size=(1280, 720))
-        if target is None:
-            path = Path(tempfile.gettempdir()) / f"panel_{entry.entry_id}.png"
-            path.write_bytes(body)
-            return str(path)
-        return str(_store_image(body, target))
-
-    @filter.button_action()
-    async def on_operator_button(self, event: AstrMessageEvent):
-        """Answer one of the buttons attached under a character card.
-
-        Args:
-            event: The button click event.
+            event: Portable button interaction.
 
         Yields:
-            The rendered sub-page, or nothing when the operation is unknown.
+            The selected MCP-backed result.
         """
         interaction = event.get_button_interaction()
-        data = interaction.data if interaction is not None else None
+        if interaction is None or not interaction.action_id.startswith("ri_"):
+            return
+        data = interaction.data
         if not isinstance(data, dict):
             return
         try:
-            issued_at = float(data.get("ts") or 0)
+            issued = float(data.get("ts") or 0)
         except (TypeError, ValueError):
-            issued_at = 0.0
-        if issued_at <= 0 or time.time() - issued_at > _CARD_TTL:
-            self.logger.debug("ignoring stale card button: %s", data)
             return
-        operation = str(data.get("op") or "")
-        game = str(data.get("game") or "")
-        entry_id = str(data.get("id") or "")
-        collector = {
-            "module": "module_panel",
-            "skin": "skin_panel",
-            "story": "story_panel",
-            "faction": "faction_panel",
-            "voice": "voice_panel",
-        }.get(operation)
-        if not collector or not entry_id:
+        age = time.time() - issued
+        if not math.isfinite(issued) or issued <= 0 or age >= _CARD_TTL or age < -5:
             return
-        operation_label = dict(_OPERATOR_ACTIONS).get(operation, operation)
-        provider = self.arknights if game == "arknights" else self.endfield
         try:
-            entry = await provider.get_detail(entry_id)
-            panel = await getattr(provider, collector)(entry)
-            if not panel:
-                yield event.plain_result(f"{entry.title} 没有{operation}数据")
-                return
-            panel["operation"] = operation
-            image = await self._panel_image(provider, entry, panel)
-        except Exception as exc:  # noqa: BLE001 - never crash the event
-            self.logger.warning(
-                "panel %s/%s/%s failed: %s: %s",
-                game,
-                operation,
-                entry_id,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
-            )
-            return
-        # QQ drops the media of an interaction reply; pushing a fresh picture
-        # needs active-message rights the bot may not have, so the text summary
-        # is the reliable answer and the picture stays one word away.
-        try:
-            sent = await self.context.send_message(
-                event.unified_msg_origin, MessageChain(chain=[Image(file=image)])
-            )
-        except Exception as exc:  # noqa: BLE001 - fall back to text
-            self.logger.info("active panel send failed: %s", exc)
-            sent = False
-        if not sent:
-            yield event.plain_result(
-                f"{entry.title} · {operation}\n发送「{operation_label}」查看完整图示"
-            )
-
-    async def terminate(self) -> None:
-        """Release the browser and the HTTP client on disable or reload."""
-        if self._renderer is not None:
-            await self._renderer.close()
-            self._renderer = None
-        await self.net.aclose()
+            if data.get("action") == "image":
+                yield await self._message(
+                    event, str(data.get("title") or "皮肤"), str(data.get("url") or "")
+                )
+            elif data.get("action") == "select" and isinstance(data.get("item"), dict):
+                yield await self._execute(
+                    event, str(data.get("operation") or "auto"), data["item"]
+                )
+        except MCPError as exc:
+            self.logger.warning("MCP button query failed: %r", exc.__cause__ or exc)
+            yield event.plain_result(str(exc))
+        except Exception as exc:  # noqa: BLE001 - isolate upstream event failures
+            self.logger.warning("Card button failed: %s", exc, exc_info=True)
+            yield event.plain_result("查询暂时失败，请稍后重试。")

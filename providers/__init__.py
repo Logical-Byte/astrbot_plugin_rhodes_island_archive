@@ -1,14 +1,6 @@
-"""Game data and resource providers."""
+"""MCP gateway and OCR helpers used by the plugin."""
 
-from .arknights import ArknightsProvider
-from .base import GameDataProvider
-from .endfield import EndfieldProvider
-from .net import NetClient, UpstreamError
+from .mcp import MCPError, MCPGateway
+from .ocr import OCRError, recognize
 
-__all__ = [
-    "ArknightsProvider",
-    "EndfieldProvider",
-    "GameDataProvider",
-    "NetClient",
-    "UpstreamError",
-]
+__all__ = ["MCPError", "MCPGateway", "OCRError", "recognize"]

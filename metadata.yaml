@@ -1,12 +1,10 @@
 name: astrbot_plugin_rhodes_island_archive
 display_name: 罗德岛数据文献馆
-short_desc: 查询明日方舟与终末地的游戏数据。
+short_desc: 通过 MCP 查询明日方舟游戏数据。
 desc: |
-  罗德岛数据文献馆 —— 明日方舟与终末地游戏数据查询插件。
-
-  唤醒词后只跟一个角色名时，命中后回复一张角色卡片图片（数值、档案、
-  潜能、天赋、基建技能、技能、装置与立绘）；未命中不回复。
-version: 0.5.1
+  罗德岛数据文献馆 —— 通过 MCP 查询明日方舟的干员、材料、关卡和公招等数据。
+  支持公招截图识别与卡片按钮交互。
+version: 0.6.8
 author: "Logical-Byte"
 repo: "https://github.com/Logical-Byte/astrbot_plugin_rhodes_island_archive"
 astrbot_version: ">=4.29.0"
