@@ -945,25 +945,6 @@ async def test_single_token_bare_name_stays_silent_when_unmatched(subject):
 
 
 @pytest.mark.asyncio
-async def test_probe_base_rewrites_only_the_local_size_probe(subject):
-    plugin, gateway, _, _ = subject
-    plugin._probe_base = "http://127.0.0.1:40317"
-    gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
-    await plugin._http.aclose()
-    seen = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        seen.append(str(request.url))
-        return httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
-
-    plugin._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-    result = (await collect(plugin.on_query(StubEvent("干员 阿米娅"))))[0]
-    markdown = await _markdown(result)
-    assert seen and seen[0].startswith("http://127.0.0.1:40317/")
-    assert "images.example.invalid" in markdown
-
-
-@pytest.mark.asyncio
 async def test_unreachable_image_host_keeps_the_card_without_size_hints(subject):
     plugin, gateway, _, _ = subject
     gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
@@ -982,16 +963,3 @@ async def test_unreachable_image_host_keeps_the_card_without_size_hints(subject)
 async def _markdown(result):
     parsed = await QQOfficialMessageEvent._parse_to_qqofficial(result)
     return parsed[0]
-
-
-@pytest.mark.asyncio
-async def test_probe_base_ignores_a_path_suffix(monkeypatch):
-    """A probe base pasted with /mcp keeps only scheme, host, and port."""
-    monkeypatch.setattr(main, "MCPGateway", lambda *args, **kwargs: object())
-    plugin = main.Main(
-        context=None,
-        config={"mcp_url": "http://example.invalid/mcp", "image_probe_base": "http://192.168.1.33:40317/mcp"},
-    )
-    assert plugin._probe_base == "http://192.168.1.33:40317"
-    assert plugin._probe_url("http://public.example/cards/a.png") == "http://192.168.1.33:40317/cards/a.png"
-    await plugin._http.aclose()

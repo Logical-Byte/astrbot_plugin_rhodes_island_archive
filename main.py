@@ -153,11 +153,6 @@ class Main(star.Star):
         self._mcp = MCPGateway(
             str(config.get("mcp_url") or "").strip(), timeout=timeout
         )
-        # Optional origin used only to read image sizes when the public host is
-        # unreachable from this machine (hairpin NAT). QQ still gets the original
-        # URL, and any path in the configured value (such as ``/mcp``) is ignored.
-        probe = urlsplit(str(config.get("image_probe_base") or "").strip())
-        self._probe_base = f"{probe.scheme}://{probe.netloc}" if probe.netloc else ""
         self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._dimensions: dict[str, tuple[int, int]] = {}
         self._vocabulary: list[str] | None = None
@@ -172,23 +167,6 @@ class Main(star.Star):
             await self._mcp.close()
         finally:
             await self._http.aclose()
-
-    def _probe_url(self, url: str) -> str:
-        """Rewrite an image URL for local size probing only.
-
-        Args:
-            url: Public image URL returned by the MCP service.
-
-        Returns:
-            The URL to fetch locally, honouring ``image_probe_base`` when set.
-        """
-        if not self._probe_base:
-            return url
-        parsed = urlsplit(url)
-        if not parsed.path:
-            return url
-        query = f"?{parsed.query}" if parsed.query else ""
-        return f"{self._probe_base}{parsed.path}{query}"
 
     async def _message(
         self,
@@ -224,7 +202,7 @@ class Main(star.Star):
                         received = 0
                         async with self._http.stream(
                             "GET",
-                            self._probe_url(url),
+                            url,
                             headers={"Range": "bytes=0-65535"},
                         ) as response:
                             response.raise_for_status()

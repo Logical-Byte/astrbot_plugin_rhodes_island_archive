@@ -8,10 +8,5 @@
     "description": "MCP 连接与请求超时（秒）",
     "type": "float",
     "default": 30.0
-  },
-  "image_probe_base": {
-    "description": "图片地址替换前缀，仅用于插件读取图片尺寸。只填协议和主机端口，例如 http://192.168.1.33:40317，不要带 /mcp；留空则直接访问 MCP 返回的地址。发给 QQ 的始终是原始地址。",
-    "type": "string",
-    "default": ""
   }
 }

@@ -4,7 +4,7 @@ short_desc: 通过 MCP 查询明日方舟游戏数据。
 desc: |
   罗德岛数据文献馆 —— 通过 MCP 查询明日方舟的干员、材料、关卡和公招等数据。
   支持公招截图识别与卡片按钮交互。
-version: 0.6.10
+version: 0.6.11
 author: "Logical-Byte"
 repo: "https://github.com/Logical-Byte/astrbot_plugin_rhodes_island_archive"
 astrbot_version: ">=4.29.0"
