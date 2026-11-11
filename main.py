@@ -153,9 +153,11 @@ class Main(star.Star):
         self._mcp = MCPGateway(
             str(config.get("mcp_url") or "").strip(), timeout=timeout
         )
-        # Optional prefix used only to read image sizes when the public host is
-        # unreachable from this machine (hairpin NAT). QQ still gets the original URL.
-        self._probe_base = str(config.get("image_probe_base") or "").strip().rstrip("/")
+        # Optional origin used only to read image sizes when the public host is
+        # unreachable from this machine (hairpin NAT). QQ still gets the original
+        # URL, and any path in the configured value (such as ``/mcp``) is ignored.
+        probe = urlsplit(str(config.get("image_probe_base") or "").strip())
+        self._probe_base = f"{probe.scheme}://{probe.netloc}" if probe.netloc else ""
         self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._dimensions: dict[str, tuple[int, int]] = {}
         self._vocabulary: list[str] | None = None

@@ -982,3 +982,16 @@ async def test_unreachable_image_host_keeps_the_card_without_size_hints(subject)
 async def _markdown(result):
     parsed = await QQOfficialMessageEvent._parse_to_qqofficial(result)
     return parsed[0]
+
+
+@pytest.mark.asyncio
+async def test_probe_base_ignores_a_path_suffix(monkeypatch):
+    """A probe base pasted with /mcp keeps only scheme, host, and port."""
+    monkeypatch.setattr(main, "MCPGateway", lambda *args, **kwargs: object())
+    plugin = main.Main(
+        context=None,
+        config={"mcp_url": "http://example.invalid/mcp", "image_probe_base": "http://192.168.1.33:40317/mcp"},
+    )
+    assert plugin._probe_base == "http://192.168.1.33:40317"
+    assert plugin._probe_url("http://public.example/cards/a.png") == "http://192.168.1.33:40317/cards/a.png"
+    await plugin._http.aclose()
