@@ -427,3 +427,14 @@ async def test_real_mcp_protocol_over_in_memory_transport(monkeypatch) -> None:
     finally:
         await gateway.close()
 
+
+
+@pytest.mark.asyncio
+async def test_missing_endpoint_asks_for_configuration() -> None:
+    """An unconfigured endpoint explains itself instead of dialing nothing."""
+    gateway = MCPGateway("")
+    with pytest.raises(MCPError, match="填写 MCP 服务地址"):
+        await gateway.call("search", {"query": "x"})
+    with pytest.raises(MCPError, match="填写 MCP 服务地址"):
+        await gateway.input_schema("recruit_with_tag")
+    await gateway.close()

@@ -93,6 +93,15 @@ class MCPGateway:
         if self._active_calls == 0:
             self._idle.set()
 
+    def _require_url(self) -> None:
+        """Reject calls when no MCP endpoint is configured.
+
+        Raises:
+            MCPError: If the configured endpoint is empty.
+        """
+        if not self._url:
+            raise MCPError("请先在插件配置中填写 MCP 服务地址。")
+
     async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Call an MCP tool and normalize its result to a dictionary.
 
@@ -106,6 +115,7 @@ class MCPGateway:
         Raises:
             MCPError: If the gateway is closed or connection, call, or decoding fails.
         """
+        self._require_url()
         client = await self._acquire_client()
         try:
             try:
@@ -130,6 +140,7 @@ class MCPGateway:
         Raises:
             MCPError: If the server cannot be reached or does not list the tool.
         """
+        self._require_url()
         client = await self._acquire_client()
         try:
             try:

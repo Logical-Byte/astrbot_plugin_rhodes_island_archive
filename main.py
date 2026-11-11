@@ -22,7 +22,6 @@ from .commands import COMMANDS, SUFFIX_PATTERN
 from .providers.mcp import MCPError, MCPGateway
 from .providers.ocr import OCRError, recognize
 
-_DEFAULT_MCP_URL = "http://bd4wxr.top:40317/mcp"
 _CARD_TTL = 300.0
 _RECRUIT_WAIT = 30.0
 _RECRUIT_KEYWORD = re.compile(r"^(公开招募|公招|高资|高姿)")
@@ -152,8 +151,11 @@ class Main(star.Star):
         except (TypeError, ValueError):
             timeout = 30.0
         self._mcp = MCPGateway(
-            str(config.get("mcp_url") or _DEFAULT_MCP_URL), timeout=timeout
+            str(config.get("mcp_url") or "").strip(), timeout=timeout
         )
+        # Optional prefix used only to read image sizes when the public host is
+        # unreachable from this machine (hairpin NAT). QQ still gets the original URL.
+        self._probe_base = str(config.get("image_probe_base") or "").strip().rstrip("/")
         self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._dimensions: dict[str, tuple[int, int]] = {}
         self._vocabulary: list[str] | None = None
@@ -168,6 +170,23 @@ class Main(star.Star):
             await self._mcp.close()
         finally:
             await self._http.aclose()
+
+    def _probe_url(self, url: str) -> str:
+        """Rewrite an image URL for local size probing only.
+
+        Args:
+            url: Public image URL returned by the MCP service.
+
+        Returns:
+            The URL to fetch locally, honouring ``image_probe_base`` when set.
+        """
+        if not self._probe_base:
+            return url
+        parsed = urlsplit(url)
+        if not parsed.path:
+            return url
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"{self._probe_base}{parsed.path}{query}"
 
     async def _message(
         self,
@@ -198,31 +217,38 @@ class Main(star.Star):
                 raise ValueError("Invalid MCP image URL")
             if event.get_platform_name().startswith("qq_official"):
                 if url not in self._dimensions:
-                    parser = ImageFile.Parser()
-                    received = 0
-                    async with self._http.stream(
-                        "GET", url, headers={"Range": "bytes=0-65535"}
-                    ) as response:
-                        response.raise_for_status()
-                        async for chunk in response.aiter_bytes():
-                            received += len(chunk)
-                            parser.feed(chunk)
-                            if parser.image is not None:
-                                width, height = parser.image.size
-                                if not (0 < width <= 65535 and 0 < height <= 65535):
-                                    raise ValueError("Invalid MCP image dimensions")
-                                self._dimensions[url] = (width, height)
-                                break
-                            if received > 2 * 1024 * 1024:
-                                break
-                    if url not in self._dimensions:
-                        raise ValueError("MCP image has no readable dimensions")
-                width, height = self._dimensions[url]
+                    try:
+                        parser = ImageFile.Parser()
+                        received = 0
+                        async with self._http.stream(
+                            "GET",
+                            self._probe_url(url),
+                            headers={"Range": "bytes=0-65535"},
+                        ) as response:
+                            response.raise_for_status()
+                            async for chunk in response.aiter_bytes():
+                                received += len(chunk)
+                                parser.feed(chunk)
+                                if parser.image is not None:
+                                    width, height = parser.image.size
+                                    if 0 < width <= 65535 and 0 < height <= 65535:
+                                        self._dimensions[url] = (width, height)
+                                    break
+                                if received > 2 * 1024 * 1024:
+                                    break
+                    except (httpx.HTTPError, OSError):
+                        # The public host may be unreachable from this machine;
+                        # QQ can still fetch the image, so drop the size hints.
+                        self.logger.debug("image size probe failed: %s", url)
                 safe_url = quote(url, safe=":/%?=&+;,@!$'*-._~%#")
                 caption = text.replace("[", "（").replace("]", "）").replace("\n", " ")
-                result.message(
-                    f"![{caption or '资料卡'} #{width}px #{height}px]({safe_url})"
-                )
+                size = self._dimensions.get(url)
+                if size:
+                    result.message(
+                        f"![{caption or '资料卡'} #{size[0]}px #{size[1]}px]({safe_url})"
+                    )
+                else:
+                    result.message(f"![{caption or '资料卡'}]({safe_url})")
                 if text:
                     result.message(f"\n{text}")
                 result.use_markdown(True)

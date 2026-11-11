@@ -1,12 +1,17 @@
 {
   "mcp_url": {
-    "description": "明日方舟知识库 MCP 服务地址（Streamable HTTP）",
+    "description": "明日方舟知识库 MCP 服务地址（Streamable HTTP，必填）",
     "type": "string",
-    "default": "http://bd4wxr.top:40317/mcp"
+    "default": ""
   },
   "timeout": {
     "description": "MCP 连接与请求超时（秒）",
     "type": "float",
     "default": 30.0
+  },
+  "image_probe_base": {
+    "description": "图片地址替换前缀，仅用于插件读取图片尺寸。服务器无法回环访问公网域名时填内网地址，例如 http://127.0.0.1:40317；留空则直接访问 MCP 返回的地址。发给 QQ 的始终是原始地址。",
+    "type": "string",
+    "default": ""
   }
 }

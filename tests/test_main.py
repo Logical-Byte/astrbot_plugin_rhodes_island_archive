@@ -942,3 +942,43 @@ async def test_single_token_bare_name_stays_silent_when_unmatched(subject):
     plugin, gateway, _, _ = subject
     replies = await collect(plugin.on_query(StubEvent("不存在的干员")))
     assert replies == []
+
+
+@pytest.mark.asyncio
+async def test_probe_base_rewrites_only_the_local_size_probe(subject):
+    plugin, gateway, _, _ = subject
+    plugin._probe_base = "http://127.0.0.1:40317"
+    gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
+    await plugin._http.aclose()
+    seen = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
+
+    plugin._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    result = (await collect(plugin.on_query(StubEvent("干员 阿米娅"))))[0]
+    markdown = await _markdown(result)
+    assert seen and seen[0].startswith("http://127.0.0.1:40317/")
+    assert "images.example.invalid" in markdown
+
+
+@pytest.mark.asyncio
+async def test_unreachable_image_host_keeps_the_card_without_size_hints(subject):
+    plugin, gateway, _, _ = subject
+    gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
+    await plugin._http.aclose()
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host", request=request)
+
+    plugin._http = httpx.AsyncClient(transport=httpx.MockTransport(boom))
+    result = (await collect(plugin.on_query(StubEvent("干员 阿米娅"))))[0]
+    markdown = await _markdown(result)
+    assert f"]({CARD_URL})" in markdown
+    assert "px #" not in markdown
+
+
+async def _markdown(result):
+    parsed = await QQOfficialMessageEvent._parse_to_qqofficial(result)
+    return parsed[0]
