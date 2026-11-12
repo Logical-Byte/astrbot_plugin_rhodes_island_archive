@@ -690,11 +690,30 @@ async def test_unwoken_number_selection_expires_with_search_card(subject):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "text", ["技能", "技能 阿米娅", "干员技能 阿米娅", "阿米娅技能", "干员 技能 阿米娅"]
+    "text",
+    [
+        "技能 阿米娅",
+        "干员技能 阿米娅",
+        "阿米娅技能",
+        "干员 技能 阿米娅",
+        "专精 阿米娅",
+        "阿米娅专精",
+    ],
 )
-async def test_skill_commands_never_trigger_or_call_retired_tool(subject, text):
+async def test_skill_and_mastery_route_to_operator_materials(subject, text):
     plugin, gateway, _, _ = subject
-    assert await collect(plugin.on_query(StubEvent(text))) == []
+    gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
+    replies = await collect(plugin.on_query(StubEvent(text)))
+    assert len(replies) == 1
+    assert ("get_operator_material", {"operator_id": "char_amy"}) in gateway.calls
+    assert all(name != "get_operator_skill" for name, _ in gateway.calls)
+
+
+@pytest.mark.asyncio
+async def test_bare_skill_word_stays_silent(subject):
+    plugin, gateway, _, _ = subject
+    assert await collect(plugin.on_query(StubEvent("技能"))) == []
+    assert await collect(plugin.on_query(StubEvent("专精"))) == []
     assert gateway.calls == []
 
 

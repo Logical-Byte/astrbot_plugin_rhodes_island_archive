@@ -20,7 +20,7 @@ AstrBot 的明日方舟数据查询插件。通过明日方舟知识库 MCP 查�
 | 指令示例 | 查询内容 | MCP 工具 |
 | --- | --- | --- |
 | `迷迭香` / `干员 迷迭香` | 干员基础资料 | `get_operator_basic_data` |
-| `干员材料 迷迭香` / `迷迭香材料` | 干员养成材料 | `get_operator_material` |
+| `干员材料 迷迭香` / `迷迭香材料` / `技能 迷迭香` / `专精 迷迭香` / `迷迭香专精` | 干员养成材料（含精英化、技能升级、专精、模组） | `get_operator_material` |
 | `模组 迷迭香` / `迷迭香模组` | 干员模组 | `get_operator_modules` |
 | `召唤物 迷迭香` | 干员召唤物 | `get_token_detail` |
 | `皮肤 迷迭香` / `迷迭香皮肤` | 干员皮肤 | `get_operator_skins` |

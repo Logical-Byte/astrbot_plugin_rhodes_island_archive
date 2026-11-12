@@ -719,7 +719,7 @@ class Main(star.Star):
             An MCP-backed result when the text matches a supported request.
         """
         text = event.get_message_str().strip()
-        text = re.sub(r"^干员\s+(材料|模组|皮肤|技能)", r"干员\1", text)
+        text = re.sub(r"^干员\s+(材料|模组|皮肤|技能|专精)", r"干员\1", text)
         rule = links.match(text)
         if rule is not None:
             yield await self._answer_link(event, rule)
@@ -749,8 +749,6 @@ class Main(star.Star):
                     yield await self._execute(
                         event, str(action.get("operation") or "auto"), action["item"]
                     )
-                return
-            if text.startswith(("技能", "干员技能")) or text.endswith("技能"):
                 return
             if text.startswith(_DISABLED_PREFIXES):
                 return

@@ -35,7 +35,9 @@ class CommandSpec:
         prefixes: Command prefixes, longest first-match wins.
         accepts: Search result types this operation may query.
         auto: Search result types that route here without an explicit command.
-        suffixes: Trailing keywords such as ``材料`` in ``迷迭香材料``.
+        suffixes: Trailing keywords such as ``材料`` in ``迷迭香材料``. Skill
+            and mastery queries point at the same materials, so ``技能`` and
+            ``专精`` share the operator-material operation.
     """
 
     operation: str
@@ -74,9 +76,9 @@ SPECS: tuple[CommandSpec, ...] = (
         "干员材料",
         "get_operator_material",
         "operator_id",
-        prefixes=("干员材料",),
+        prefixes=("干员材料", "干员技能", "干员专精", "技能", "专精"),
         accepts=frozenset({"干员"}),
-        suffixes=("材料",),
+        suffixes=("材料", "技能", "专精"),
     ),
     CommandSpec(
         "modules",
