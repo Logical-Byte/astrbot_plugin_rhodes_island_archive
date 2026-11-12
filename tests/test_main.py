@@ -404,11 +404,11 @@ async def test_qq_group_image_then_buttons_survive_real_adapter(
     )
     gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
     replies = await collect(plugin.on_query(StubEvent("干员 阿米娅")))
-    result, button_row = replies[0], last_with_buttons(replies)
+    assert len(replies) == 1
+    result = replies[0]
     assert result.use_markdown_ is True
     assert any(isinstance(part, Plain) for part in result.chain)
-    assert not any(isinstance(part, ActionRow) for part in result.chain)
-    assert any(isinstance(part, ActionRow) for part in button_row.chain)
+    assert any(isinstance(part, ActionRow) for part in result.chain)
     assert not any(isinstance(part, Image) for part in result.chain)
     assert len(requests) == 1
     assert requests[0].headers["range"] == "bytes=0-65535"
@@ -418,7 +418,7 @@ async def test_qq_group_image_then_buttons_survive_real_adapter(
     assert f"]({CARD_URL})" in markdown
     assert "#1px #1px" in markdown
     assert image_base64 is None and image_path is None
-    keyboard = QQOfficialMessageEvent._parse_keyboard(button_row)
+    keyboard = QQOfficialMessageEvent._parse_keyboard(result)
     native_buttons = keyboard["content"]["rows"][0]["buttons"]
     assert [button["render_data"]["label"] for button in native_buttons] == [
         "模组",
@@ -463,16 +463,10 @@ async def test_qq_group_image_then_buttons_survive_real_adapter(
     await qq.send(result)
     parent_send.assert_awaited_once()
     assert parent_send.await_args.args[0].chain == result.chain
-    card_payload = bot.api.post_group_message.await_args.kwargs
-    assert card_payload["msg_type"] == 2
-    assert card_payload["markdown"]["content"] == markdown
-    assert "keyboard" not in card_payload
-    assert "media" not in card_payload
-
-    bot.api.post_group_message.reset_mock()
-    await qq.send(button_row)
+    bot.api.post_group_message.assert_awaited_once()
     payload = bot.api.post_group_message.await_args.kwargs
     assert payload["msg_type"] == 2
+    assert payload["markdown"]["content"] == markdown
     assert "相关资料" in payload["markdown"]["content"]
     assert payload["keyboard"] == keyboard
     assert "media" not in payload

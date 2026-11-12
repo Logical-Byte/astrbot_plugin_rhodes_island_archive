@@ -161,7 +161,6 @@ class Main(star.Star):
         self._selections: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._recent_images: dict[tuple[str, str], Image] = {}
         self._pending_recruit: dict[tuple[str, str], float] = {}
-        self._follow_ups: dict[str, list[MessageEventResult]] = {}
 
     async def terminate(self) -> None:
         """Close both MCP and image-metadata connections on plugin unload."""
@@ -199,74 +198,96 @@ class Main(star.Star):
             return await self._message(event, f"{rule.label} {rule.url}", rule.url)
         return event.chain_result([Image.fromBytes(content)])
 
+    async def _probe_size(self, url: str) -> None:
+        """Cache an image's pixel size for QQ Markdown size hints.
+
+        Args:
+            url: Public image URL.
+        """
+        if url in self._dimensions:
+            return
+        try:
+            parser = ImageFile.Parser()
+            received = 0
+            async with self._http.stream(
+                "GET", url, headers={"Range": "bytes=0-65535"}
+            ) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes():
+                    received += len(chunk)
+                    parser.feed(chunk)
+                    if parser.image is not None:
+                        width, height = parser.image.size
+                        if 0 < width <= 65535 and 0 < height <= 65535:
+                            self._dimensions[url] = (width, height)
+                        break
+                    if received > 2 * 1024 * 1024:
+                        break
+        except (httpx.HTTPError, OSError):
+            # The public host may be unreachable from this machine; QQ can still
+            # fetch the image, so drop the size hints.
+            self.logger.debug("image size probe failed: %s", url)
+
     async def _message(
         self,
         event: AstrMessageEvent,
         text: str,
         url: str = "",
         actions: list[dict[str, Any]] | None = None,
+        images: list[tuple[str, str]] | None = None,
+        caption: str = "",
     ) -> MessageEventResult:
-        """Compose one reply, keeping QQ Markdown images and buttons together.
+        """Compose one reply, keeping every QQ Markdown image and button inline.
 
         Args:
             event: Incoming message or button event.
             text: Short caption or error message.
-            url: Public image URL returned by the MCP service.
+            url: Main public image URL returned by the MCP service.
             actions: Optional button descriptions.
+            images: Extra ``(caption, url)`` images rendered in the same message.
+            caption: Label for the main image, defaulting to ``text``.
 
         Returns:
             A platform-compatible message chain.
 
         Raises:
-            ValueError: If an image URL or its dimensions are invalid.
+            ValueError: If an image URL is not absolute HTTP(S).
             httpx.HTTPError: If image metadata cannot be fetched.
         """
-        result = MessageEventResult()
+        attachments = list(images or [])
         if url:
-            parsed = urlsplit(url)
-            if parsed.scheme not in ("http", "https") or not parsed.hostname:
-                raise ValueError("Invalid MCP image URL")
+            attachments.insert(0, (caption or text, url))
+        result = MessageEventResult()
+        if attachments:
+            for _, target in attachments:
+                parsed = urlsplit(target)
+                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                    raise ValueError("Invalid MCP image URL")
             if event.get_platform_name().startswith("qq_official"):
-                if url not in self._dimensions:
-                    try:
-                        parser = ImageFile.Parser()
-                        received = 0
-                        async with self._http.stream(
-                            "GET",
-                            url,
-                            headers={"Range": "bytes=0-65535"},
-                        ) as response:
-                            response.raise_for_status()
-                            async for chunk in response.aiter_bytes():
-                                received += len(chunk)
-                                parser.feed(chunk)
-                                if parser.image is not None:
-                                    width, height = parser.image.size
-                                    if 0 < width <= 65535 and 0 < height <= 65535:
-                                        self._dimensions[url] = (width, height)
-                                    break
-                                if received > 2 * 1024 * 1024:
-                                    break
-                    except (httpx.HTTPError, OSError):
-                        # The public host may be unreachable from this machine;
-                        # QQ can still fetch the image, so drop the size hints.
-                        self.logger.debug("image size probe failed: %s", url)
-                safe_url = quote(url, safe=":/%?=&+;,@!$'*-._~%#")
-                caption = text.replace("[", "（").replace("]", "）").replace("\n", " ")
-                size = self._dimensions.get(url)
-                if size:
-                    result.message(
-                        f"![{caption or '资料卡'} #{size[0]}px #{size[1]}px]({safe_url})"
+                lines: list[str] = []
+                for caption, target in attachments:
+                    await self._probe_size(target)
+                    safe_url = quote(target, safe=":/%?=&+;,@!$'*-._~%#")
+                    label = (
+                        caption.replace("[", "（").replace("]", "）").replace("\n", " ")
+                        or "资料卡"
                     )
-                else:
-                    result.message(f"![{caption or '资料卡'}]({safe_url})")
+                    size = self._dimensions.get(target)
+                    if size:
+                        lines.append(
+                            f"![{label} #{size[0]}px #{size[1]}px]({safe_url})"
+                        )
+                    else:
+                        lines.append(f"![{label}]({safe_url})")
                 if text:
-                    result.message(f"\n{text}")
+                    lines.append(text)
+                result.message("\n".join(lines))
                 result.use_markdown(True)
             else:
                 if text:
                     result.message(text)
-                result.url_image(url)
+                for _, target in attachments:
+                    result.url_image(target)
         else:
             result.message(text)
         result.chain.extend(_buttons(actions or []))
@@ -463,16 +484,17 @@ class Main(star.Star):
             token_card = (
                 str(tokens.get("卡片") or "") if isinstance(tokens, dict) else ""
             )
-            pending: list[MessageEventResult] = []
+            extras: list[tuple[str, str]] = []
             if token_card:
-                pending.append(
-                    await self._message(event, f"{title} 的召唤物", token_card)
-                )
-            pending.append(
-                await self._message(event, f"{title} · 相关资料", actions=actions)
+                extras.append((f"{title} 的召唤物", token_card))
+            return await self._message(
+                event,
+                f"{title} · 相关资料",
+                url,
+                actions=actions,
+                images=extras,
+                caption=title,
             )
-            self._follow_ups[event.unified_msg_origin] = pending
-            return await self._message(event, title, url)
         elif operation == "skins" and isinstance(data, dict):
             skins = [skin for skin in data.get("skins") or [] if isinstance(skin, dict)]
             if skin_id:
@@ -822,8 +844,6 @@ class Main(star.Star):
             )
             if result is not None:
                 yield result
-                for extra in self._follow_ups.pop(event.unified_msg_origin, []):
-                    yield extra
         except MCPError as exc:
             self.logger.warning("MCP query failed: %r", exc.__cause__ or exc)
             if operation != "auto":
