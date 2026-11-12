@@ -56,7 +56,6 @@ class _QueryFilter(filter.CustomFilter):
         return (
             event.is_at_or_wake_command
             or bool(_SELECTION.fullmatch(text))
-            or text in {"模组", "皮肤", "材料", "召唤物"}
             or links.match(text) is not None
         )
 
@@ -159,7 +158,6 @@ class Main(star.Star):
         self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._dimensions: dict[str, tuple[int, int]] = {}
         self._vocabulary: list[str] | None = None
-        self._last_operator: dict[str, tuple[dict[str, Any], float]] = {}
         self._selections: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._recent_images: dict[tuple[str, str], Image] = {}
         self._pending_recruit: dict[tuple[str, str], float] = {}
@@ -450,7 +448,6 @@ class Main(star.Star):
             if isinstance(names, dict):
                 title = str(names.get("中文名") or title)
             operator = {"id": item_id, "name": title, "type": "干员"}
-            self._last_operator[event.unified_msg_origin] = (operator, time.time())
             actions = [
                 {
                     "label": label,
@@ -702,24 +699,12 @@ class Main(star.Star):
         text = event.get_message_str().strip()
         text = re.sub(r"^干员\s+(材料|模组|皮肤|技能)", r"干员\1", text)
         rule = links.match(text)
-        if rule is not None and text == "材料" and not event.is_at_or_wake_command:
-            # A freshly shown operator card keeps the「材料」button working; the
-            # bare word only falls through to the image shortcut without it.
-            saved = self._last_operator.get(event.unified_msg_origin)
-            if saved is not None and time.time() - saved[1] < _CARD_TTL:
-                rule = None
         if rule is not None:
             yield await self._answer_link(event, rule)
             return
         selection = _SELECTION.fullmatch(text)
-        panel_word = text in {"模组", "皮肤", "材料", "召唤物"}
         if not event.is_at_or_wake_command and not selection:
-            saved = self._last_operator.get(event.unified_msg_origin)
-            if saved is not None and time.time() - saved[1] >= _CARD_TTL:
-                self._last_operator.pop(event.unified_msg_origin, None)
-                saved = None
-            if not panel_word or saved is None:
-                return
+            return
         operation = "auto"
         try:
             if selection:
@@ -824,12 +809,7 @@ class Main(star.Star):
                 operation in ("modules", "skins", "operator_material", "token")
                 and not query
             ):
-                saved = self._last_operator.get(event.unified_msg_origin)
-                if saved is None or time.time() - saved[1] >= _CARD_TTL:
-                    self._last_operator.pop(event.unified_msg_origin, None)
-                    yield event.plain_result("请在指令后提供干员名称。")
-                    return
-                yield await self._execute(event, operation, saved[0])
+                # A bare command word carries no operator, so it stays unanswered.
                 return
             if operation == "auto" and not text:
                 return

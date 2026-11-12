@@ -69,7 +69,7 @@ AstrBot 的明日方舟数据查询插件。通过明日方舟知识库 MCP 查�
 | 材料 / 活动 / 复刻 | 图片，默认 `http://bd4wxr.top:5040/api/files?name=材料` |
 | 进店 | 图片，默认 `http://bd4wxr.top:5040/api/files?name=进店` |
 
-表存在配置项 `links`（JSON 数组，字段 `label` / `pattern` / `url` / `image`），`pattern` 为整体匹配的正则。部署在内网时可把地址替换为内网地址。干员卡刚发出 5 分钟内单独发「材料」仍按材料按钮处理，之后才走图片直达。
+表存在配置项 `links`（JSON 数组，字段 `label` / `pattern` / `url` / `image`），`pattern` 为整体匹配的正则。部署在内网时可把地址替换为内网地址。单发「模组」「皮肤」「召唤物」这类需要干员名的词不会匹配；「材料」本身就是图片直达，与干员卡无关。
 
 ## 说明
 

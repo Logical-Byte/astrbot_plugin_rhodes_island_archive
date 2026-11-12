@@ -668,28 +668,15 @@ async def test_unwoken_messages_are_silent_and_do_not_query(subject, text):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("text", "tool"),
-    [
-        ("模组", "get_operator_modules"),
-        ("皮肤", "get_operator_skins"),
-        ("召唤物", "get_token_detail"),
-    ],
-)
-async def test_unwoken_card_fallback_words_expire_with_the_card(subject, text, tool):
-    plugin, gateway, clock, _ = subject
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["模组", "皮肤", "召唤物"])
+async def test_bare_command_words_without_an_operator_stay_unanswered(subject, text):
+    plugin, gateway, _, _ = subject
     gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
-    gateway.tool_results["get_operator_basic_data"] = {
-        "data": {"召唤物": {"列表": [{"id": "token_amy", "名称": "装置"}]}},
-        "card_image_url": CARD_URL,
-    }
     assert len(await collect(plugin.on_query(StubEvent("干员 阿米娅")))) >= 1
     gateway.calls.clear()
-    assert len(await collect(plugin.on_query(StubEvent(text, wake=False)))) == 1
-    assert gateway.calls[-1][0] == tool
-    gateway.calls.clear()
-    clock[0] += 300
     assert await collect(plugin.on_query(StubEvent(text, wake=False))) == []
+    assert await collect(plugin.on_query(StubEvent(text))) == []
     assert gateway.calls == []
 
 
@@ -870,7 +857,7 @@ def test_unwoken_chat_does_not_activate_plugin_filters(text):
 
 def test_plugin_filters_accept_wake_followups_and_image():
     assert main._QueryFilter().filter(StubEvent("干员 阿米娅"), None)
-    assert main._QueryFilter().filter(StubEvent("模组", wake=False), None)
+    assert main._QueryFilter().filter(StubEvent("材料", wake=False), None)
     assert main._QueryFilter().filter(StubEvent("选择1", wake=False), None)
     image = Image.fromURL("https://images.example.invalid/screenshot.png")
     assert main._ImageFilter().filter(StubEvent(wake=False, images=[image]), None)
@@ -1036,15 +1023,12 @@ async def test_link_image_is_downloaded_every_time(subject):
 
 
 @pytest.mark.asyncio
-async def test_bare_material_prefers_the_fresh_card_then_the_image(monkeypatch, subject):
-    """材料 follows the shown operator while fresh, then the image shortcut."""
-    plugin, gateway, clock, _ = subject
+async def test_bare_material_always_returns_the_image(subject):
+    """材料 no longer borrows the operator card, so the image shortcut is stable."""
+    plugin, gateway, _, _ = subject
     gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
     await collect(plugin.on_query(StubEvent("干员 阿米娅")))
     gateway.calls.clear()
-    await collect(plugin.on_query(StubEvent("材料", wake=False)))
-    assert gateway.calls[-1][0] == "get_operator_material"
-    clock[0] += 301
     await plugin._http.aclose()
     plugin._http = httpx.AsyncClient(
         transport=httpx.MockTransport(
@@ -1055,3 +1039,4 @@ async def test_bare_material_prefers_the_fresh_card_then_the_image(monkeypatch, 
     )
     replies = await collect(plugin.on_query(StubEvent("材料", wake=False)))
     assert all(isinstance(part, Image) for part in replies[0].chain)
+    assert gateway.calls == []
