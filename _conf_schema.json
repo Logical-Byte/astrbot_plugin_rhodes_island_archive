@@ -8,5 +8,10 @@
     "description": "MCP 连接与请求超时（秒）",
     "type": "float",
     "default": 30.0
+  },
+  "links": {
+    "description": "关键词直达表。JSON 数组，每项 {label, pattern, url, image}：pattern 为完整匹配的正则，image 为 true 时把 url 当图片发送（每次重新下载，不做缓存）。内网地址可按部署环境替换为公网域名。",
+    "type": "text",
+    "default": "[\n  {\n    \"label\": \"一图流\",\n    \"pattern\": \"一图流\",\n    \"url\": \"https://ark.yituliu.cn/\"\n  },\n  {\n    \"label\": \"商店性价比\",\n    \"pattern\": \"(?:一图流)?商店性价比\",\n    \"url\": \"https://ark.yituliu.cn/material/store\"\n  },\n  {\n    \"label\": \"礼包性价比\",\n    \"pattern\": \"(?:一图流)?礼包性价比\",\n    \"url\": \"https://ark.yituliu.cn/material/pack\"\n  },\n  {\n    \"label\": \"物品价值\",\n    \"pattern\": \"(?:一图流)?(?:物品)?价值\",\n    \"url\": \"https://ark.yituliu.cn/material/value\"\n  },\n  {\n    \"label\": \"攒抽计算器\",\n    \"pattern\": \"(?:一图流)?攒抽(?:计算器)?\",\n    \"url\": \"https://ark.yituliu.cn/tools/gachaCalc\"\n  },\n  {\n    \"label\": \"特米米\",\n    \"pattern\": \"特米米\",\n    \"url\": \"https://tomimi.cyou/zh\"\n  },\n  {\n    \"label\": \"企鹅物流\",\n    \"pattern\": \"企鹅物流\",\n    \"url\": \"https://penguin-stats.io/\"\n  },\n  {\n    \"label\": \"终末地一图流\",\n    \"pattern\": \"终末地一图流\",\n    \"url\": \"https://ef.yituliu.cn/\"\n  },\n  {\n    \"label\": \"蓝图站\",\n    \"pattern\": \"(?:终末地)?蓝图站\",\n    \"url\": \"https://talospioneers.com/zh-CN\"\n  },\n  {\n    \"label\": \"终末地 wiki\",\n    \"pattern\": \"终末地wiki\",\n    \"url\": \"https://warfarin.wiki/cn\"\n  },\n  {\n    \"label\": \"热能池规划\",\n    \"pattern\": \"热能池(?:规划)?\",\n    \"url\": \"https://dige.aunly.cn/?lang=zh\"\n  },\n  {\n    \"label\": \"材料\",\n    \"pattern\": \"材料|活动|复刻\",\n    \"url\": \"http://bd4wxr.top:5040/api/files?name=材料\",\n    \"image\": true\n  },\n  {\n    \"label\": \"进店\",\n    \"pattern\": \"进店\",\n    \"url\": \"http://bd4wxr.top:5040/api/files?name=进店\",\n    \"image\": true\n  }\n]"
   }
 }

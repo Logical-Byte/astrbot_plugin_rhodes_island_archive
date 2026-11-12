@@ -6,6 +6,8 @@ import base64
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import json
+
 import botpy.message
 import httpx
 import pytest
@@ -25,7 +27,7 @@ from astrbot.core.platform.button_interaction import decode_button_callback
 from astrbot.core.platform.sources.qqofficial.qqofficial_message_event import (
     QQOfficialMessageEvent,
 )
-from data.plugins.astrbot_plugin_rhodes_island_archive import main
+from data.plugins.astrbot_plugin_rhodes_island_archive import links, main
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aHosAAAAASUVORK5CYII="
@@ -145,6 +147,9 @@ class StubEvent:
     def plain_result(self, text: str) -> MessageEventResult:
         return MessageEventResult().message(text)
 
+    def chain_result(self, chain) -> MessageEventResult:
+        return MessageEventResult(chain=chain)
+
 
 @pytest_asyncio.fixture
 async def subject(monkeypatch):
@@ -203,6 +208,18 @@ def text_of(result: MessageEventResult) -> str:
     return "".join(part.text for part in result.chain if isinstance(part, Plain))
 
 
+def last_with_buttons(replies):
+    """Return the final reply that carries the button row.
+
+    Args:
+        replies: All results produced for one incoming message.
+
+    Returns:
+        The last result, which holds the action row for operator cards.
+    """
+    return replies[-1]
+
+
 def buttons_of(result: MessageEventResult):
     """Flatten all buttons in the result, preserving their visual order.
 
@@ -249,7 +266,7 @@ async def test_all_detail_commands_forward_exact_mcp_arguments(
     plugin, gateway, _, _ = subject
     gateway.search_items = [{"id": "fixture_id", "name": "测试名称", "type": kind}]
     replies = await collect(plugin.on_query(StubEvent(f"{prefix} 测试名称")))
-    assert len(replies) == 1
+    assert replies
     assert gateway.calls == [
         ("search", {"query": "测试名称"}),
         (tool, {argument: "fixture_id"}),
@@ -266,7 +283,7 @@ async def test_exact_alias_outranks_fuzzy_and_filters_result_type(subject):
         {"id": "exact_id", "name": "阿米娅", "from_alias": "小兔", "type": "干员"},
     ]
     replies = await collect(plugin.on_query(StubEvent("干员 小兔")))
-    assert len(replies) == 1
+    assert CARD_URL in text_of(replies[0])
     assert gateway.calls == [
         ("search", {"query": "小兔"}),
         ("get_operator_basic_data", {"operator_id": "exact_id"}),
@@ -292,7 +309,7 @@ async def test_exact_id_is_resolved_through_search_card(subject):
     plugin, gateway, _, _ = subject
     gateway.search_items = [{"id": "char_002_amiya", "name": "阿米娅", "type": "干员"}]
     replies = await collect(plugin.on_query(StubEvent("干员 char_002_amiya")))
-    assert len(replies) == 1
+    assert CARD_URL in text_of(replies[0])
     assert gateway.calls == [
         ("build_search_card", {"ids": ["char_002_amiya"]}),
         ("get_operator_basic_data", {"operator_id": "char_002_amiya"}),
@@ -374,7 +391,7 @@ async def test_search_command_always_shows_selection_card(subject):
 
 
 @pytest.mark.asyncio
-async def test_qq_group_image_and_buttons_survive_real_adapter_as_one_message(
+async def test_qq_group_image_then_buttons_survive_real_adapter(
     subject, monkeypatch
 ):
     plugin, gateway, _, requests = subject
@@ -386,10 +403,12 @@ async def test_qq_group_image_and_buttons_survive_real_adapter_as_one_message(
         button_interaction._ButtonCallbackRegistry(),
     )
     gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
-    result = (await collect(plugin.on_query(StubEvent("干员 阿米娅"))))[0]
+    replies = await collect(plugin.on_query(StubEvent("干员 阿米娅")))
+    result, button_row = replies[0], last_with_buttons(replies)
     assert result.use_markdown_ is True
     assert any(isinstance(part, Plain) for part in result.chain)
-    assert any(isinstance(part, ActionRow) for part in result.chain)
+    assert not any(isinstance(part, ActionRow) for part in result.chain)
+    assert any(isinstance(part, ActionRow) for part in button_row.chain)
     assert not any(isinstance(part, Image) for part in result.chain)
     assert len(requests) == 1
     assert requests[0].headers["range"] == "bytes=0-65535"
@@ -399,7 +418,7 @@ async def test_qq_group_image_and_buttons_survive_real_adapter_as_one_message(
     assert f"]({CARD_URL})" in markdown
     assert "#1px #1px" in markdown
     assert image_base64 is None and image_path is None
-    keyboard = QQOfficialMessageEvent._parse_keyboard(result)
+    keyboard = QQOfficialMessageEvent._parse_keyboard(button_row)
     native_buttons = keyboard["content"]["rows"][0]["buttons"]
     assert [button["render_data"]["label"] for button in native_buttons] == [
         "模组",
@@ -444,10 +463,17 @@ async def test_qq_group_image_and_buttons_survive_real_adapter_as_one_message(
     await qq.send(result)
     parent_send.assert_awaited_once()
     assert parent_send.await_args.args[0].chain == result.chain
-    bot.api.post_group_message.assert_awaited_once()
+    card_payload = bot.api.post_group_message.await_args.kwargs
+    assert card_payload["msg_type"] == 2
+    assert card_payload["markdown"]["content"] == markdown
+    assert "keyboard" not in card_payload
+    assert "media" not in card_payload
+
+    bot.api.post_group_message.reset_mock()
+    await qq.send(button_row)
     payload = bot.api.post_group_message.await_args.kwargs
     assert payload["msg_type"] == 2
-    assert payload["markdown"]["content"] == markdown
+    assert "相关资料" in payload["markdown"]["content"]
     assert payload["keyboard"] == keyboard
     assert "media" not in payload
 
@@ -459,8 +485,8 @@ async def test_qq_group_image_and_buttons_survive_real_adapter_as_one_message(
 async def test_button_silently_expires_after_five_minutes(subject, age, expected_count):
     plugin, gateway, clock, _ = subject
     gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
-    result = (await collect(plugin.on_query(StubEvent("干员 阿米娅"))))[0]
-    button = buttons_of(result)[0]
+    replies = await collect(plugin.on_query(StubEvent("干员 阿米娅")))
+    button = buttons_of(last_with_buttons(replies))[0]
     clock[0] += age
     interaction = ButtonInteraction(
         action_id=button.id, data=button.action.data, interaction_id="click"
@@ -484,11 +510,12 @@ async def test_operator_title_uses_chinese_name_object(subject):
         "data": {"名称": {"中文名": "阿米娅", "英文名": "Amiya"}},
         "card_image_url": CARD_URL,
     }
-    result = (await collect(plugin.on_query(StubEvent("干员 搜索名"))))[0]
-    assert "阿米娅 · 干员" in text_of(result)
-    assert "{'中文名'" not in text_of(result)
+    replies = await collect(plugin.on_query(StubEvent("干员 搜索名")))
+    assert "阿米娅" in text_of(replies[0])
+    assert "{'中文名'" not in "".join(text_of(reply) for reply in replies)
     assert all(
-        button.action.data["item"]["name"] == "阿米娅" for button in buttons_of(result)
+        button.action.data["item"]["name"] == "阿米娅"
+        for button in buttons_of(last_with_buttons(replies))
     )
 
 
@@ -646,7 +673,6 @@ async def test_unwoken_messages_are_silent_and_do_not_query(subject, text):
     [
         ("模组", "get_operator_modules"),
         ("皮肤", "get_operator_skins"),
-        ("材料", "get_operator_material"),
         ("召唤物", "get_token_detail"),
     ],
 )
@@ -657,7 +683,7 @@ async def test_unwoken_card_fallback_words_expire_with_the_card(subject, text, t
         "data": {"召唤物": {"列表": [{"id": "token_amy", "名称": "装置"}]}},
         "card_image_url": CARD_URL,
     }
-    assert len(await collect(plugin.on_query(StubEvent("干员 阿米娅")))) == 1
+    assert len(await collect(plugin.on_query(StubEvent("干员 阿米娅")))) >= 1
     gateway.calls.clear()
     assert len(await collect(plugin.on_query(StubEvent(text, wake=False)))) == 1
     assert gateway.calls[-1][0] == tool
@@ -963,3 +989,69 @@ async def test_unreachable_image_host_keeps_the_card_without_size_hints(subject)
 async def _markdown(result):
     parsed = await QQOfficialMessageEvent._parse_to_qqofficial(result)
     return parsed[0]
+
+
+def test_link_table_matches_whole_words_only():
+    table = links.LinkTable(links.parse_rules(None))
+    assert table.match("进店").url.endswith("name=进店")
+    assert table.match("材料").image is True
+    assert table.match("材料 固源岩") is None
+    assert table.match("商店性价比").url == "https://ark.yituliu.cn/material/store"
+    assert table.match("兔兔一图流") is None
+
+
+def test_link_table_accepts_json_overrides():
+    raw = json.dumps([{"label": "自定义", "pattern": "测试", "url": "https://x.invalid/a"}])
+    table = links.LinkTable(links.parse_rules(raw))
+    assert table.match("测试").label == "自定义"
+    assert table.match("进店") is None
+    assert links.parse_rules("{").__len__() == 13
+
+
+@pytest.mark.asyncio
+async def test_link_answer_returns_url_text(subject):
+    plugin, _, _, _ = subject
+    rule = links.LinkRule("一图流", "一图流", "https://ark.yituliu.cn/")
+    result = await plugin._answer_link(StubEvent("一图流"), rule)
+    assert result.chain[0].text == "一图流 https://ark.yituliu.cn/"
+
+
+@pytest.mark.asyncio
+async def test_link_image_is_downloaded_every_time(subject):
+    plugin, _, _, _ = subject
+    await plugin._http.aclose()
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
+
+    plugin._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    rule = links.LinkRule("进店", "进店", "http://bd4wxr.top:5040/api/files?name=进店", True)
+    first = await plugin._answer_link(StubEvent("进店"), rule)
+    second = await plugin._answer_link(StubEvent("进店"), rule)
+    assert len(calls) == 2
+    assert all(isinstance(part, Image) for part in first.chain)
+    assert all(isinstance(part, Image) for part in second.chain)
+
+
+@pytest.mark.asyncio
+async def test_bare_material_prefers_the_fresh_card_then_the_image(monkeypatch, subject):
+    """材料 follows the shown operator while fresh, then the image shortcut."""
+    plugin, gateway, clock, _ = subject
+    gateway.search_items = [{"id": "char_amy", "name": "阿米娅", "type": "干员"}]
+    await collect(plugin.on_query(StubEvent("干员 阿米娅")))
+    gateway.calls.clear()
+    await collect(plugin.on_query(StubEvent("材料", wake=False)))
+    assert gateway.calls[-1][0] == "get_operator_material"
+    clock[0] += 301
+    await plugin._http.aclose()
+    plugin._http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, content=PNG, headers={"content-type": "image/png"}
+            )
+        )
+    )
+    replies = await collect(plugin.on_query(StubEvent("材料", wake=False)))
+    assert all(isinstance(part, Image) for part in replies[0].chain)

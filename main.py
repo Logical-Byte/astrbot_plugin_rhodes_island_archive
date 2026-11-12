@@ -18,6 +18,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import ActionRow, Button, Image
 from astrbot.core.message.message_event_result import MessageEventResult
 
+from . import links
 from .commands import COMMANDS, SUFFIX_PATTERN
 from .providers.mcp import MCPError, MCPGateway
 from .providers.ocr import OCRError, recognize
@@ -56,6 +57,7 @@ class _QueryFilter(filter.CustomFilter):
             event.is_at_or_wake_command
             or bool(_SELECTION.fullmatch(text))
             or text in {"模组", "皮肤", "材料", "召唤物"}
+            or links.match(text) is not None
         )
 
 
@@ -153,6 +155,7 @@ class Main(star.Star):
         self._mcp = MCPGateway(
             str(config.get("mcp_url") or "").strip(), timeout=timeout
         )
+        links.set_rules(config.get("links"))
         self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._dimensions: dict[str, tuple[int, int]] = {}
         self._vocabulary: list[str] | None = None
@@ -160,6 +163,7 @@ class Main(star.Star):
         self._selections: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._recent_images: dict[tuple[str, str], Image] = {}
         self._pending_recruit: dict[tuple[str, str], float] = {}
+        self._follow_ups: dict[str, list[MessageEventResult]] = {}
 
     async def terminate(self) -> None:
         """Close both MCP and image-metadata connections on plugin unload."""
@@ -167,6 +171,35 @@ class Main(star.Star):
             await self._mcp.close()
         finally:
             await self._http.aclose()
+
+    async def _answer_link(
+        self, event: AstrMessageEvent, rule: Any
+    ) -> MessageEventResult:
+        """Answer a keyword shortcut with a link or a freshly fetched image.
+
+        Args:
+            event: Incoming message event.
+            rule: Matched rule from the configurable keyword table.
+
+        Returns:
+            A text link, the image itself, or an image link when the fetch fails.
+        """
+        if not rule.image:
+            return event.plain_result(f"{rule.label} {rule.url}")
+        try:
+            response = await self._http.get(rule.url)
+            response.raise_for_status()
+            content = response.content
+            content_type = response.headers.get("content-type", "")
+        except (httpx.HTTPError, OSError):
+            self.logger.warning("link image fetch failed: %s", rule.url)
+            return await self._message(event, f"{rule.label} {rule.url}", rule.url)
+        if not content_type.startswith("image/"):
+            self.logger.warning(
+                "link image has unexpected type %s: %s", content_type, rule.url
+            )
+            return await self._message(event, f"{rule.label} {rule.url}", rule.url)
+        return event.chain_result([Image.fromBytes(content)])
 
     async def _message(
         self,
@@ -430,17 +463,19 @@ class Main(star.Star):
                 )
             ]
             tokens = data.get("召唤物")
-            if isinstance(tokens, dict) and tokens.get("列表"):
-                actions.append(
-                    {
-                        "label": "召唤物",
-                        "data": {
-                            "action": "select",
-                            "operation": "token",
-                            "item": operator,
-                        },
-                    }
+            token_card = (
+                str(tokens.get("卡片") or "") if isinstance(tokens, dict) else ""
+            )
+            pending: list[MessageEventResult] = []
+            if token_card:
+                pending.append(
+                    await self._message(event, f"{title} 的召唤物", token_card)
                 )
+            pending.append(
+                await self._message(event, f"{title} · 相关资料", actions=actions)
+            )
+            self._follow_ups[event.unified_msg_origin] = pending
+            return await self._message(event, title, url)
         elif operation == "skins" and isinstance(data, dict):
             skins = [skin for skin in data.get("skins") or [] if isinstance(skin, dict)]
             if skin_id:
@@ -666,6 +701,16 @@ class Main(star.Star):
         """
         text = event.get_message_str().strip()
         text = re.sub(r"^干员\s+(材料|模组|皮肤|技能)", r"干员\1", text)
+        rule = links.match(text)
+        if rule is not None and text == "材料" and not event.is_at_or_wake_command:
+            # A freshly shown operator card keeps the「材料」button working; the
+            # bare word only falls through to the image shortcut without it.
+            saved = self._last_operator.get(event.unified_msg_origin)
+            if saved is not None and time.time() - saved[1] < _CARD_TTL:
+                rule = None
+        if rule is not None:
+            yield await self._answer_link(event, rule)
+            return
         selection = _SELECTION.fullmatch(text)
         panel_word = text in {"模组", "皮肤", "材料", "召唤物"}
         if not event.is_at_or_wake_command and not selection:
@@ -797,6 +842,8 @@ class Main(star.Star):
             )
             if result is not None:
                 yield result
+                for extra in self._follow_ups.pop(event.unified_msg_origin, []):
+                    yield extra
         except MCPError as exc:
             self.logger.warning("MCP query failed: %r", exc.__cause__ or exc)
             if operation != "auto":

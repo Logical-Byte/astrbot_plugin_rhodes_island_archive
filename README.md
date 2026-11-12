@@ -49,6 +49,28 @@ AstrBot 的明日方舟数据查询插件。通过明日方舟知识库 MCP 查�
 
 也可直接发送 `公招 资深 输出`、`高资 治疗` 等文字标签。支持的标签来自 MCP 接口；服务端未识别的标签会在结果中提示。
 
+## 关键词直达
+
+内置一张可改写的关键词表，命中后直接回链接；标为图片的规则会把图片下载后作为图片消息发送，每次重新获取，不做缓存。
+
+| 关键词 | 目标 |
+| --- | --- |
+| 一图流 | https://ark.yituliu.cn/ |
+| 商店性价比 / 一图流商店性价比 | https://ark.yituliu.cn/material/store |
+| 礼包性价比 / 一图流礼包性价比 | https://ark.yituliu.cn/material/pack |
+| 价值 / 物品价值 | https://ark.yituliu.cn/material/value |
+| 攒抽 / 攒抽计算器 | https://ark.yituliu.cn/tools/gachaCalc |
+| 特米米 | https://tomimi.cyou/zh |
+| 企鹅物流 | https://penguin-stats.io/ |
+| 终末地一图流 | https://ef.yituliu.cn/ |
+| 蓝图站 / 终末地蓝图站 | https://talospioneers.com/zh-CN |
+| 终末地wiki | https://warfarin.wiki/cn |
+| 热能池 / 热能池规划 | https://dige.aunly.cn/?lang=zh |
+| 材料 / 活动 / 复刻 | 图片，默认 `http://bd4wxr.top:5040/api/files?name=材料` |
+| 进店 | 图片，默认 `http://bd4wxr.top:5040/api/files?name=进店` |
+
+表存在配置项 `links`（JSON 数组，字段 `label` / `pattern` / `url` / `image`），`pattern` 为整体匹配的正则。部署在内网时可把地址替换为内网地址。干员卡刚发出 5 分钟内单独发「材料」仍按材料按钮处理，之后才走图片直达。
+
 ## 说明
 
 - `mcp_url` 必填，填 MCP 服务的完整地址（以 `/mcp` 结尾）。
