@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import base64
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-
-import json
 
 import botpy.message
 import httpx
@@ -391,9 +390,7 @@ async def test_search_command_always_shows_selection_card(subject):
 
 
 @pytest.mark.asyncio
-async def test_qq_group_image_then_buttons_survive_real_adapter(
-    subject, monkeypatch
-):
+async def test_qq_group_image_then_buttons_survive_real_adapter(subject, monkeypatch):
     plugin, gateway, _, requests = subject
     parent_send = AsyncMock()
     monkeypatch.setattr(AstrMessageEvent, "send", parent_send)
@@ -956,9 +953,18 @@ async def test_bare_strategy_item_name_routes_through_its_bare_type(subject):
 
 
 @pytest.mark.asyncio
-async def test_unrecognized_multiword_query_answers_instead_of_staying_silent(subject):
+@pytest.mark.parametrize("text", ["旧版藏品 王庭盟约", "订阅 688411531"])
+async def test_unrecognized_multiword_query_stays_silent(subject, text):
     plugin, gateway, _, _ = subject
-    replies = await collect(plugin.on_query(StubEvent("旧版藏品 王庭盟约")))
+    replies = await collect(plugin.on_query(StubEvent(text)))
+    assert replies == []
+    assert gateway.calls == [("search", {"query": text})]
+
+
+@pytest.mark.asyncio
+async def test_explicit_unmatched_query_still_reports_no_match(subject):
+    plugin, _, _, _ = subject
+    replies = await collect(plugin.on_query(StubEvent("干员 不存在")))
     assert len(replies) == 1
     assert "没有找到" in text_of(replies[0])
 
@@ -1001,7 +1007,9 @@ def test_link_table_matches_whole_words_only():
 
 
 def test_link_table_accepts_json_overrides():
-    raw = json.dumps([{"label": "自定义", "pattern": "测试", "url": "https://x.invalid/a"}])
+    raw = json.dumps(
+        [{"label": "自定义", "pattern": "测试", "url": "https://x.invalid/a"}]
+    )
     table = links.LinkTable(links.parse_rules(raw))
     assert table.match("测试").label == "自定义"
     assert table.match("进店") is None
@@ -1027,7 +1035,9 @@ async def test_link_image_is_downloaded_every_time(subject):
         return httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
 
     plugin._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-    rule = links.LinkRule("进店", "进店", "http://bd4wxr.top:5040/api/files?name=进店", True)
+    rule = links.LinkRule(
+        "进店", "进店", "http://bd4wxr.top:5040/api/files?name=进店", True
+    )
     first = await plugin._answer_link(StubEvent("进店"), rule)
     second = await plugin._answer_link(StubEvent("进店"), rule)
     assert len(calls) == 2

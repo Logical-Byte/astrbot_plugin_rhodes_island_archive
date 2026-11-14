@@ -833,12 +833,12 @@ class Main(star.Star):
                 return
             if operation == "auto" and not text:
                 return
-            # Single-token bare names stay silent; anything else answers explicitly.
+            # Unrecognized automatic queries must remain available to other plugins.
             result = await self._lookup(
                 event,
                 query,
                 operation,
-                silent=operation == "auto" and not re.search(r"\s", text),
+                silent=operation == "auto",
             )
             if result is not None:
                 yield result
